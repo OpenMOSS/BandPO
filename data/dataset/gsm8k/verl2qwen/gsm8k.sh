@@ -1,0 +1,1 @@
+python3 gsm8k.py --local_save_dir $BandPODir/data/dataset/gsm8k/verl2dapo

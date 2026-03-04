@@ -1,0 +1,1 @@
+sinfo --Node -O "PARTITION:15,NodeList:12,GresUsed:10,CPUsState:20,StateLong:12,FreeMem:12,TimeStamp:12:

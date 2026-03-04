@@ -1,0 +1,46 @@
+请你作为一名大语言模型的研究专家与我对话，精通自然语言处理的传统研究，特别是embedding，和现在的大语言模型研究。
+我现在有一些零散的显卡，一个完整节点（8张A800 80G），一些分散在各个节点的A800 80G显卡（3张）。4090D显卡100张。（但是没有nvlink，显卡之间彼此不连接）。我的强化学习训练需要一个完整的8卡节点训练。
+我通过字节跳动的大语言模型的强化学习训练框架Verl训练模型，落盘了训练过程中的如下数据（details数据没有，因为太大了，存不下）,每一条训练sample都保存了，每个sample如下（部分数据由于dapo的dynamic filter被dropped，所以部分数据没有保存，可以加一个传参，我传入kept，只看被保留下来训练的，不看dropped）：
+- timestamp- epoch- global_step- uid- filter_state- filter_reason- prompt_text- response_text- prompt_len_tokens- response_len_tokens- total_len_tokens- en_cfg- old_logprob_mean- old_logprob_sum- rollout_logprob_mean- rollout_logprob_sum- ref_logprob_mean- ref_logprob_sum- reward_seq_mean- reward_seq_sum- adv_seq_mean- value_seq_mean- kl_value_mean- entropy_mean- kl_seq_mean_log_ratio- kl_seq_sum_log_ratio- entropy_seq_mean- entropy_seq_sum
+现在我们要聚焦于一个问题，模型的训练崩溃，我们猜测是前期的很多被认为是正确的答案的sample中有噪声导致的。我发现很多时候大语言模型训练过程中的回复会有一些低质量的噪声数据，虽然最后答案正确，但是中间过程有问题，导致训练崩溃。具体现象分几种，如下： 
+1. 中间胡言乱语，出现很多乱码，输出奇怪字符、非常用字符、一堆看不懂的 token，甚至是多种语言混杂，或一长串重复同一个词、同一句话。突然最后冒出一个正确答案。
+2. 不乱码了，但是兜圈子，讲车轱辘话。大量「反思标记」：wait, 等一下, hold on, moment mal, подожди 等。或者是大量连词: however, but, on the other hand, 所以, 因此, 所以说 等。每一段话语语义上差不多，来回绕圈，但最后还是给了答案（猜测是token mean loss mode引出的对于被回复长度的reward hacking）。或者是最后给出的是一个不确定的答案，尽管是正确的，但其实模型并不确定是否正确。
+3. 把最后的答案重复很多遍，猜测是现在的大语言模型的reward一般都是加在最后一个token上导致的。
+
+我们是希望让模型做出长回复，也就是希望使用token mean的loss mode。但是，我们训练的1.5B模型对于长的CoT并没有太高的质量，为了提高质量，我们希望过滤掉一部分数据。（具体如何过滤再议）。我们现在希望是先去统计一下刚刚跑出来的一个jsonl文件，尝试先把过滤器的过滤条件和具体的threshhold之类的参数确定好。
+我们前期统计：sample总量3121840，dropped的sample有1462960，kept的sample有1658880。
+kept中，ce大于1.8的：正确的有11条；- 错误的有1525-11=1514条。我想的是我们不筛选错误的，错误的就错的，没啥好纠结的。关键是对的那些sample，有一些噪声。
+但是ce大于1.8的，kept（也就是最终被训练的sample里面）正确的有11条，量很少。又统计了repeat_word_run_max>25的数量，有51条。
+也就是说这些rule规则形式的filter过滤效果有限。我们需要一个更加强大的过滤器。
+
+经过我和学长的讨论，我们决定使用基于语义的方法，引入embedding模型来过滤。毕竟很多语言的东西还是需要基于语义的方法。
+我们想聚焦在大语言模型回复的一个具体问题，会有一些自我打断 / 自我修正 / 重启思考 的 discourse marker（话语标记），比如，最常见的现象：“wait”，“wait”、“等一下”、“hold on”、“moment mal”、“подожди” 这一类东西。除此之外，还有一些连词，however（“推理分支/反例/修正”的对比标记），so/therefore （“推出结果/做结论”的推论标记）。等等这些标记的地方一般而言，token 熵极高，对于推理极为重要。
+wait这样的打断去反思，以及however等不断去转折，去不断的创新思考，迭代想法，这本身是一个好事情。
+但似乎模型训练到后期，经常会出现一些不好的现象。在这些转折过后，模型开始重复单词，或者胡言乱语。一些说一些车轱辘话。我猜想有可能是token mean带来了reward hacking。让模型故意拖沓，很多时候最终会有答案。但是前期拖沓。讲车轱辘话，有时候甚至是不断打断自己思考，最终给一个模棱两可的答案。还有一点是我感觉现在直接把reward加在最后一个token上的方法有问题，很多sample肯定就是他搞坏的——最后会不断的重复最终的答案。
+更麻烦的是，模型会开始经常打断自己兜圈子，本来4096的长度没多长，正常打断3次左右吧（有的会高一点），结果一部分response打断次数甚至有13次之多。
+
+讲了很多研究的前期问题和经验，我们现在要做一件事情：对离线的jsonl文件做分析。
+
+首先现在需要完成第一个事情：
+1. 文本段的预处理：
+第一步（切分）：对于每一个sample的response，用\n去分section，要考虑多个连在一起的\n，他们应该是一整个切分的标记，不要独立切开。
+- 最简单基础的按\n切分整个response，这样切割出来的section可能是一个section含有多个句子，甚至其中有多个转折。每个切割的\n就放在他的前一个section中保留下来。不要有任何的清洗操作，该是什么就是什么，只是在整个response的str的某个标记点做了一个分割。
+- 不要用marker区分，模型这个时候“Wait, wait, wait, but, but, so...”这种时候会出问题。
+- 使用pysbd 的Segmenter切分每个section，使用语言en（可能出现语言混合的现象，假设是主要语言为英语）。不要使用HuggingFace：多语言 SBD 模型配套 Python 包 punctuators，这会增加工程量，暂时不考虑。不要有任何的清洗操作，该是什么就是什么，只是在每个section级别的的str的某个标记点做了一个分割。
+保存每个response的切分为list的list（需要保存到统计结果的文件中），这样一个数据就能表达两个层级的信息，统计粗切分的section量，以及细节分之后的sentence量，作为新的metrics写入统计。不清洗的话直接把整个section对应的sentencelist合并起来就是原话。
+第二步（标记）：只抓三类即可，SELF_REFLECT（其实就已经包含了SELF_CORRECT），转折 / 对立CONTRAST，推论 / 结论CONCLUDE，但是需要考虑的多语言，英语，中文，德语，俄语，等。
+考虑使用三层list来存储，也就是每个之前被切分的sentence都会有一个list维护他有三种marker中的几种。查section level的marker的话就把他对应list[i]取出来得到list的list结构，把其中各个句子的marker做一个并集即可。
+第三步：reponse的语言统计：看一下prompt中是否有中文，看一下整个response中各个语言的占比。
+2. embbedding模型分析：
+- 对于每个sentence level的str：得出如下metrics：主要使用什么语言讲话？embedding的向量，保存方式使用存储marker那样的方式。
+- 对于每个sample的response：
+    - 统计转折（每个section的分析）：到底有多少个这样的转折：wait这一类的统计一下，so，however，等等这些连词的也分别来统计一下，最后汇总一下总的转折量是多少，section 数目，sentence 数目，含有marker的sentence数目，含有marker的section数目。分两个level,section level 以及sentence都分别去统计一下。
+    - 统计语义相似现象（仅限于单个response内）：也就是重复啰嗦的现象。每一个response里面，wait以及其他的转折的marker形成了很多段不必要的话语，重复啰嗦，最后才给出答案。我们来统计大概有哪几种语义，看看有没有重复啰嗦，比如某一类语义的wait的section有3个及以上。我猜想一个思路，分别都对sentence级别和section级别（2个级别）都去做如下的聚类，每一个聚类分成三个层次（3个层次），首先是看全部的，其次是看有marker的（有的没被打上marker，对应的marker的list是空的），最后是看最为关键的wait这一类marker对应的所有句子的。就是去看它在不同切分句子的情况下，需要被聚类的这些各个被切分的str之间的相似度之类的指标，去做一个聚类。总共应该有6个细分的聚类结果。聚类的方法：对于每一个str片段（可能是一个sentence，也可能是一个section片段），算一些指标，看看语义相似程度，形成几个cluster。特别是考虑到可能同一个response中可能有不同语言的情况，以及各个不同response的主要回复语言不同的情况（可能需要对不同语言的相似程度设置的语义相似的threshhold不一样？）。
+    - 统计整个response中的车轱辘话情况：讲话在绕圈子。这个交给你了，我不太有思路。这里是你重点需要思考的地方，想一想应该怎么实现这个功能。
+
+注意：
+1. 我训练的是deepseek distill R1 1.5B模型，这个模型比较小，但是中文、英文、德文、俄文、意大利语等等其他语言都会说（回复时时而说中文，时而说英文，以及俄文等等）。有时候会回答的文本多语言混杂。rule的方法不太好统计。需要考虑使用多语言的embedding 模型。
+2. training dataset是数学推理任务的文本解答比较复杂，虽然对于这个任务，embedding 不需要掌握高等数学，但是我们综合考量可以使用BAAI/bge-m3甚至更加强大的模型来做embedding model。我的回复长度目前设置为4096，prompt长度为1024，考虑冗余。
+
+具体的数据结构、算法等我只是给出了我的思路，你如果有更好的或者你更喜欢的按照你的来。
+全面思考，结合公式和例子给出你的思路和框架，完整全面介绍应该怎么做，理论上的公式，以及具体落地的工程方法。特别是每一个关键步骤，有哪些方法，应该怎么做才能最好最稳，具体的理论如何，具体工程实践如何。暂时不要给代码先确定框架和思路——每个最终要计算的metrics应该如何计算。

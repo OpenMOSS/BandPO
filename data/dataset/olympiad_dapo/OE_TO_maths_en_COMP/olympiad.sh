@@ -1,0 +1,1 @@
+python olympiad.py --local_dir $BandPODir/data/dataset/olympiad_dapo/OE_TO_maths_en_COMP

@@ -1,0 +1,6 @@
+完善并检查代码：
+1. 检查一下我之前的一些算法细节你是否都对应上了。
+2.  检查一下你的代码有没有写错的地方，比如我看这里有点问题：
+cfg.only_kept = bool(args.only_kept or True)       # 会永远变成 True
+cfg.only_correct = bool(args.only_correct or True) # 也是永远 True
+抓重点，言简意赅地说明一下代码的调用逻辑和功能。如果代码有问题要修改，修改面积过大或复杂就重新完整全面的给出代码，如果问题小，就给出修复的上下文位置和内容。

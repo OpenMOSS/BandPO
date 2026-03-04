@@ -1,0 +1,1 @@
+huggingface-cli download open-r1/DAPO-Math-17k-Processed --repo-type dataset --local-dir "$BandPODir/data/datasets/dapo_processed"

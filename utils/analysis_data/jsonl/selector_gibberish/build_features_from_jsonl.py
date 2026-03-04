@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Build a feature store + random-access index for huge rollout JSONL.
+
+Outputs under --out-dir:
+  - features.parquet        : one row per sample, compact dtypes
+  - meta.json               : source file stats, schema version, snapshot mapping
+  - (optional) step_runs.parquet : if you want fast "by-step" windowing (computed from line_no order)
+
+Design highlights
+- Single sequential pass to collect (line_no, byte_offset, byte_len) while updating file size/mtime.
+- Multi-process workers re-open the source file and pread() each (offset,len) to parse JSON bytes
+  and compute all metrics (CPU-bound -> processes > threads).
+- Robust to malformed lines: keep a 'valid' flag; all metrics become NaN on failure.
+- Snapshot configurable dot-keys (e.g., 'response_text', 'prompt_text', 'reward_extra_infos.acc').
+- Strong dtypes (float32 / int32 / int8) to keep Parquet small.
+"""
+
+from __future__ import annotations
+from pathlib import Path
+from dataclasses import dataclass
+import argparse, json, os, sys, time, math, hashlib
+from typing import Any, Dict, List, Tuple, Optional
+import multiprocessing as mp
+import numpy as np
+import pandas as pd
+
+# ---------- fast json ----------
+try:
+    import orjson
+    def _json_loads(b: bytes):
+        return orjson.loads(b)
+except Exception:
+    import json as _json
+    def _json_loads(b: bytes):
+        return _json.loads(b.decode("utf-8", errors="replace"))
+
+# ---------- text metrics (same math as你的可视化脚本，略有整理) ----------
+import unicodedata, zlib
+REPL_CHAR = "\uFFFD"
+
+# ---------- Chinese detector ----------
+# 规则：凡命中 CJK 统一汉字/扩展块 或 CJK 标点/全角符号，即视为“包含中文”
+# 覆盖：CJK Ext A/B/C/D/E/F、基本区、兼容汉字，以及 CJK 标点（\u3000-\u303F）
+import re
+_CHN_RE = re.compile(
+    r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3000-\u303F"
+    r"\U00020000-\U0002A6DF\U0002A700-\U0002B73F\U0002B740-\U0002B81F"
+    r"\U0002B820-\U0002CEAF\U0002CEB0-\U0002EBEF]"
+)
+
+def contains_chinese(s: str) -> bool:
+    if not s:
+        return False
+    return bool(_CHN_RE.search(s))
+
+def text_metrics(s: str) -> Dict[str, float]:
+    try:
+        b = s.encode("utf-8", errors="replace")
+        cnt = len(s)
+        if cnt == 0:
+            return {
+                "resp_char_len": 0.0, "resp_byte_len": 0.0, "non_ascii_ratio": 0.0,
+                "replacement_char_ratio": 0.0, "control_private_unassigned_ratio": 0.0,
+                "repeat_char_run_max": 0.0, "repeat_word_run_max": 0.0, "unique_word_ratio": 0.0,
+                "top1_word_prop": 0.0, "trigram_repeat_ratio": 0.0, "compress_ratio": 1.0,
+                "char_entropy_bits_per_char": 0.0,
+            }
+
+        non_ascii = sum(1 for ch in s if ord(ch) > 127)
+        repl_ratio = s.count(REPL_CHAR) / cnt
+        bad_cat = 0
+        for ch in s:
+            cat = unicodedata.category(ch)
+            if cat.startswith("C") or cat in {"Co", "Cs", "Cn"}:
+                bad_cat += 1
+        cpu_ratio = bad_cat / cnt
+
+        # char run
+        max_char_run = 1
+        run = 1
+        for i in range(1, cnt):
+            if s[i] == s[i-1]:
+                run += 1
+                if run > max_char_run: max_char_run = run
+            else:
+                run = 1
+
+        words = [w for w in s.split() if w]
+        if not words:
+            uniq_ratio = 0.0
+            top1_prop = 0.0
+            max_word_run = float(max_char_run)
+            trigram_rep = 0.0
+        else:
+            from collections import Counter
+            wlen = len(words)
+            uniq_ratio = len(set(words)) / wlen
+            wc = Counter(words)
+            top1_prop = wc.most_common(1)[0][1] / wlen
+
+            max_word_run = 1
+            run = 1
+            for i in range(1, wlen):
+                if words[i] == words[i-1]:
+                    run += 1
+                    if run > max_word_run: max_word_run = run
+                else: run = 1
+
+            if wlen >= 3:
+                tgs = [tuple(words[i:i+3]) for i in range(wlen-2)]
+                c3 = Counter(tgs)
+                trigram_rep = sum(v for v in c3.values() if v > 1) / len(tgs)
+            else:
+                trigram_rep = 0.0
+
+        try:
+            comp = zlib.compress(b, level=6)
+            comp_ratio = len(comp) / max(1, len(b))
+        except Exception:
+            comp_ratio = 1.0
+
+        from collections import Counter
+        cc = Counter(s)
+        probs = [c / cnt for c in cc.values()]
+        ent = -sum(p * math.log2(p) for p in probs)
+
+        return {
+            "resp_char_len": float(cnt),
+            "resp_byte_len": float(len(b)),
+            "non_ascii_ratio": float(non_ascii / cnt),
+            "replacement_char_ratio": float(repl_ratio),
+            "control_private_unassigned_ratio": float(cpu_ratio),
+            "repeat_char_run_max": float(max_char_run),
+            "repeat_word_run_max": float(max_word_run),
+            "unique_word_ratio": float(uniq_ratio),
+            "top1_word_prop": float(top1_prop),
+            "trigram_repeat_ratio": float(trigram_rep),
+            "compress_ratio": float(comp_ratio),
+            "char_entropy_bits_per_char": float(ent),
+        }
+    except Exception:
+        # do not crash the builder on weird strings
+        return {
+            "resp_char_len": np.nan, "resp_byte_len": np.nan, "non_ascii_ratio": np.nan,
+            "replacement_char_ratio": np.nan, "control_private_unassigned_ratio": np.nan,
+            "repeat_char_run_max": np.nan, "repeat_word_run_max": np.nan, "unique_word_ratio": np.nan,
+            "top1_word_prop": np.nan, "trigram_repeat_ratio": np.nan, "compress_ratio": np.nan,
+            "char_entropy_bits_per_char": np.nan,
+        }
+
+def get_nested(d: Dict[str, Any], path: str, default: Any=None) -> Any:
+    cur: Any = d
+    for k in path.split("."):
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+def classify_record(obj: Dict[str, Any], correct_key: Optional[str], use_reward_sum_fallback=True) -> int:
+    # 1=correct, 0=wrong, 2=no_judge
+    v = None
+    if correct_key:
+        v = get_nested(obj, correct_key, None)
+    if v is None:
+        rei = obj.get("reward_extra_infos") or obj.get("reward_extra_infos_dict")
+        if isinstance(rei, dict):
+            for k in ["is_correct","correct","equal","any_of_three","pass","ok","acc","accuracy","label"]:
+                if k in rei:
+                    v = rei[k]; break
+    if v is None and use_reward_sum_fallback:
+        rs = obj.get("reward_seq_sum", None)
+        if isinstance(rs, (int,float)):
+            v = (rs > 0)
+    def _to_bool(x):
+        if isinstance(x, bool): return x
+        if isinstance(x, (int, float)): return x > 0
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in {"true","t","yes","y","correct","right","pass","ok","passed","success"}: return True
+            if s in {"false","f","no","n","wrong","incorrect","fail","failed"}: return False
+            try: return float(s) > 0
+            except: return None
+        return None
+    b = _to_bool(v)
+    if b is None: return 2
+    return 1 if b else 0
+
+def neg(x):
+    try:
+        xf = float(x)
+        if math.isfinite(xf):
+            return -xf
+        return np.nan
+    except Exception:
+        return np.nan
+
+def sanitize_snap_col(path: str) -> str:
+    # dotpath -> safe column: "snap__a.b.c" -> "snap__a__b__c"
+    return "snap__" + path.replace(".", "__")
+
+@dataclass
+class BuildConfig:
+    jsonl: Path
+    out_dir: Path
+    procs: int
+    chunk_lines: int
+    correct_key: Optional[str]
+    snapshot_keys: List[str]
+    compute_sha256: bool
+
+SCHEMA_VERSION = 1
+
+# ---------- worker ----------
+def _worker_process(jsonl_path: str,
+                    offsets: List[Tuple[int,int,int]],
+                    correct_key: Optional[str],
+                    snapshot_keys: List[str]) -> Dict[str, Any]:
+    """
+    offsets: list of (line_no, offset, length)
+    """
+    fd = os.open(jsonl_path, os.O_RDONLY)
+    rows = []
+
+    # prepare snap col names
+    snap_cols = [(k, sanitize_snap_col(k)) for k in snapshot_keys]
+
+    for line_no, off, ln in offsets:
+        try:
+            b = os.pread(fd, ln, off)
+        except Exception:
+            # very unlikely; skip
+            obj = None
+        else:
+            try:
+                obj = _json_loads(b)
+            except Exception:
+                obj = None
+
+        rec: Dict[str, Any] = {
+            "line_no": line_no,
+            "byte_offset": off,
+            "byte_len": ln,
+            "valid": 1 if isinstance(obj, dict) else 0,
+            "global_step": np.int32(get_nested(obj, "global_step", -1)) if obj else np.int32(-1),
+            "uid": str(obj.get("uid")) if (obj and "uid" in obj) else "",
+            "kept_flag": np.int8( 1 if (obj and obj.get("filter_state")=="kept")
+                             else (0 if (obj and obj.get("filter_state")=="dropped") else -1) ),
+            # CE/KL/Entropy/Reward/length
+            "ce_self_seq_mean": np.float32(neg(obj.get("old_logprob_mean") if obj else None)),
+            "ce_self_seq_sum":  np.float32(neg(obj.get("old_logprob_sum") if obj else None)),
+            "ce_ref_seq_mean":  np.float32(neg(obj.get("ref_logprob_mean") if obj else None)),
+            "ce_ref_seq_sum":   np.float32(neg(obj.get("ref_logprob_sum") if obj else None)),
+            "reward_seq_sum":   np.float32(obj.get("reward_seq_sum") if obj else np.nan),
+            "kl_seq_mean_log_ratio": np.float32(obj.get("kl_seq_mean_log_ratio") if obj else np.nan),
+            "entropy_seq_mean":      np.float32(obj.get("entropy_seq_mean") if obj else np.nan),
+            "response_len_tokens":   np.float32(obj.get("response_len_tokens") if obj else np.nan),
+            "cls_id": np.int8( classify_record(obj, correct_key=correct_key) if obj else 2 ),
+        }
+
+        # text metrics
+        rt = obj.get("response_text") if isinstance(obj, dict) else None
+        # --- contain_chinese：优先看 response_text，缺失时回退看 prompt_text ---
+        if isinstance(obj, dict):
+            pt = obj.get("prompt_text")
+        else:
+            pt = None
+
+        if isinstance(rt, str) or isinstance(pt, str):
+            has_cn = (contains_chinese(rt) if isinstance(rt, str) else False) \
+                     or (contains_chinese(pt) if isinstance(pt, str) else False)
+            rec["contain_chinese"] = np.int8(1 if has_cn else 0)
+        else:
+            # 无法判断（如解析失败/无文本）
+            rec["contain_chinese"] = np.int8(-1)
+        
+        if isinstance(rt, str):
+            tm = text_metrics(rt)
+        else:
+            tm = {k: np.nan for k in [
+                "resp_char_len","resp_byte_len","non_ascii_ratio","replacement_char_ratio",
+                "control_private_unassigned_ratio","repeat_char_run_max","repeat_word_run_max",
+                "unique_word_ratio","top1_word_prop","trigram_repeat_ratio","compress_ratio",
+                "char_entropy_bits_per_char"
+            ]}
+        for k, v in tm.items():
+            rec[k] = np.float32(v)
+
+        # snapshots (any dotpath)
+        if isinstance(obj, dict):
+            for path, col in snap_cols:
+                try:
+                    val = get_nested(obj, path, None)
+                except Exception:
+                    val = None
+                rec[col] = val
+        else:
+            for _, col in snap_cols:
+                rec[col] = None
+
+        rows.append(rec)
+
+    os.close(fd)
+    df = pd.DataFrame(rows)
+    # compact dtypes
+    df["line_no"] = df["line_no"].astype(np.int64)
+    df["byte_offset"] = df["byte_offset"].astype(np.int64)
+    df["byte_len"] = df["byte_len"].astype(np.int32)
+    df["global_step"] = df["global_step"].astype(np.int32)
+    df["kept_flag"] = df["kept_flag"].astype(np.int8)
+    df["cls_id"] = df["cls_id"].astype(np.int8)
+    if "contain_chinese" in df.columns:
+        df["contain_chinese"] = df["contain_chinese"].astype(np.int8)
+    return {"df": df}
+
+# 新增：可 picklable 的顶层包装函数（避免 lambda/闭包）
+def _worker_entry(args):
+    jsonl_path, offsets, correct_key, snapshot_keys = args
+    return _worker_process(jsonl_path, offsets, correct_key, snapshot_keys)
+
+# ---------- main ----------
+def _scan_offsets(jsonl: Path, chunk_lines: int, compute_sha256: bool):
+    """
+    Sequentially iterate binary lines to get (line_no, offset, length).
+    Also compute sha256 if requested (in-stream).
+    """
+    offsets: List[Tuple[int,int,int]] = []
+    chunks: List[List[Tuple[int,int,int]]] = []
+    hasher = hashlib.sha256() if compute_sha256 else None
+
+    with jsonl.open("rb", buffering=1024*1024) as f:
+        line_no = 0
+        while True:
+            off = f.tell()
+            line = f.readline()
+            if not line:
+                if offsets:
+                    chunks.append(offsets); offsets = []
+                break
+            line_no += 1
+            if hasher:
+                hasher.update(line)
+            ln = len(line)
+            offsets.append((line_no, off, ln))
+            if len(offsets) >= chunk_lines:
+                chunks.append(offsets)
+                offsets = []
+    sha256 = hasher.hexdigest() if hasher else ""
+    stat = jsonl.stat()
+    return chunks, sha256, stat.st_size, int(stat.st_mtime)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jsonl", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 8)//2))
+    ap.add_argument("--chunk-lines", type=int, default=20000)
+    ap.add_argument("--correct-key", type=str, default=None,
+                    help="Dot path for correctness label, e.g., reward_extra_infos.acc")
+    ap.add_argument("--snapshot-keys", type=str, default="response_text,prompt_text",
+                    help="Comma separated dot-keys to snapshot for fast export.")
+    ap.add_argument("--compute-sha256", action="store_true",
+                    help="Compute sha256 of source file for strong validation (costly on very large files).")
+    args = ap.parse_args()
+
+    cfg = BuildConfig(
+        jsonl=args.jsonl,
+        out_dir=args.out_dir,
+        procs=int(args.procs),
+        chunk_lines=int(args.chunk_lines),
+        correct_key=args.correct_key,
+        snapshot_keys=[s.strip() for s in args.snapshot_keys.split(",") if s.strip()],
+        compute_sha256=bool(args.compute_sha256),
+    )
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    features_path = cfg.out_dir / "features.parquet"
+    meta_path = cfg.out_dir / "meta.json"
+
+    print(f"[INFO] Scanning offsets: {cfg.jsonl}")
+    t0 = time.time()
+    chunks, sha256, fsize, mtime = _scan_offsets(cfg.jsonl, cfg.chunk_lines, cfg.compute_sha256)
+    print(f"[INFO] Found {sum(len(c) for c in chunks):,} lines, chunks={len(chunks)}, took {time.time()-t0:.1f}s")
+
+    # process chunks in parallel and append to Parquet
+    print(f"[INFO] Processing with {cfg.procs} processes …")
+    t1 = time.time()
+    writer = None
+    n_rows = 0
+    import pyarrow as pa, pyarrow.parquet as pq
+    # with mp.get_context("spawn").Pool(processes=cfg.procs) as pool:
+    #     for i, ret in enumerate(pool.imap_unordered(
+    #         lambda offs: _worker_process(str(cfg.jsonl), offs, cfg.correct_key, cfg.snapshot_keys),
+    #         chunks,
+    #         chunksize=1
+    #     )):
+    #         df: pd.DataFrame = ret["df"]
+    
+    # with mp.get_context("spawn").Pool(processes=cfg.procs) as pool:
+    with mp.get_context("fork").Pool(processes=cfg.procs) as pool:
+        # 将每个任务打包成一个 tuple，避免 lambda/闭包
+        tasks = [(str(cfg.jsonl), offs, cfg.correct_key, cfg.snapshot_keys) for offs in chunks]
+        for i, ret in enumerate(pool.imap_unordered(
+            _worker_entry,     # 顶层可 picklable 的函数
+            tasks,
+            chunksize=1
+        )):
+            df: pd.DataFrame = ret["df"]
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(features_path, table.schema, compression="zstd", version="2.6")
+            writer.write_table(table)
+            n_rows += len(df)
+            if (i+1) % 10 == 0:
+                print(f"  [Write] {i+1}/{len(chunks)} chunks, rows={n_rows:,}")
+
+    if writer is not None:
+        writer.close()
+
+    print(f"[INFO] Wrote features: {features_path} (rows={n_rows:,})  in {time.time()-t1:.1f}s")
+
+    # meta.json
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        "source_jsonl": str(cfg.jsonl),
+        "source_size": fsize,
+        "source_mtime": mtime,
+        "source_sha256": sha256,
+        "features_path": str(features_path),
+        "rows": n_rows,
+        "snapshot_keys": cfg.snapshot_keys,
+        "snapshot_columns": {k: sanitize_snap_col(k) for k in cfg.snapshot_keys},
+        "build_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "args": {
+            "procs": cfg.procs,
+            "chunk_lines": cfg.chunk_lines,
+            "correct_key": cfg.correct_key,
+            "compute_sha256": cfg.compute_sha256,
+        }
+    }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[INFO] Wrote meta: {meta_path}")
+
+    print("[SUMMARY]")
+    print(f"  rows={n_rows:,}")
+    print(f"  features={features_path}")
+    print(f"  meta={meta_path}")
+
+if __name__ == "__main__":
+    main()

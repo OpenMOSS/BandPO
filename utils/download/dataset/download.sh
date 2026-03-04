@@ -1,0 +1,1 @@
+huggingface-cli download yentinglin/aime_2025 --repo-type dataset --local-dir "/remote-home1/yli/Workspace/BandPO/data/datasets/aime2025/test"

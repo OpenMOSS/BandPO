@@ -1,0 +1,1 @@
+scontrol show job JOBID

@@ -1,0 +1,3025 @@
+请你作为一名大语言模型的研究专家与我对话，精通自然语言处理的传统研究，特别是embedding，和现在的大语言模型研究。
+
+我现在分别拥有128个CPU和8个4090显卡，有一个jsonl文件需要被过滤处理。
+这是jsonl文件地址：
+/remote-home1/bwang/workspace_yli/BandPO/data/records/RLtraining_DapoMathDataset_DeepseekR1_1.5B/grpo_plus_ray_trgppo01_tokenmean_df/sample_traces+2025-11-10_02-16-15.jsonl
+这是其中一条的样子：
+{"timestamp": "2025-11-11T19:25:23Z", "epoch": 7, "global_step": 357, "uid": "cc883230-eb75-4207-85b4-4fc3059b86e4", "filter_state": "kept", "filter_reason": null, "prompt_text": "<｜User｜>Solve the following math problem step by step. The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n The cards of a standard 52-card deck are dealt out in a circle. What is the expected number of pairs of adjacent cards which are both black? Express your answer as a common fraction. \n\nRemember to put your answer on its own line after \"Answer:\".<｜Assistant｜><think>\n", "response_text": "\n\nAnswer: \\frac{650}{51}", "prompt_len_tokens": 98, "response_len_tokens": 2292, "total_len_tokens": 2390, "gen_cfg": {"temperature": 1.0, "top_p": 1.0, "top_k": -1, "max_new_tokens": 4096, "n": 16, "do_sample": true}, "old_logprob_mean": -0.7273972034454346, "old_logprob_sum": -1667.1943359375, "rollout_logprob_mean": null, "rollout_logprob_sum": null, "ref_logprob_mean": -0.8565726280212402, "ref_logprob_sum": -1963.2645263671875, "reward_seq_mean": 0.00043630017898976803, "reward_seq_sum": 1.0, "adv_seq_mean": 0.3659619987010956, "value_seq_mean": null, "kl_value_mean": null, "entropy_mean": null, "kl_seq_mean_log_ratio": 0.12917546927928925, "kl_seq_sum_log_ratio": 296.0701904296875, "entropy_seq_mean": 0.5089299082756042, "entropy_seq_sum": 1166.46728515625}
+
+问题背景：
+现在我们要聚焦于一个问题，模型的训练崩溃，我们猜测是前期的很多被认为是正确的答案的sample中有噪声导致的。我发现很多时候大语言模型训练过程中的回复会有一些低质量的噪声数据，虽然最后答案正确，但是中间过程有问题，导致训练崩溃。具体现象分几种，如下： 
+1. 中间胡言乱语，出现很多乱码，输出奇怪字符、非常用字符、一堆看不懂的 token，甚至是多种语言混杂，或一长串重复同一个词、同一句话。突然最后冒出一个正确答案。
+2. 不乱码了，但是兜圈子，讲车轱辘话。大量「反思标记」：wait, 等一下, hold on, moment mal, подожди 等。或者是大量连词: however, but, on the other hand, 所以, 因此, 所以说 等。每一段话语语义上差不多，来回绕圈，但最后还是给了答案（猜测是token mean loss mode引出的对于被回复长度的reward hacking）。或者是最后给出的是一个不确定的答案，尽管是正确的，但其实模型并不确定是否正确。
+3. 把最后的答案重复很多遍，猜测是现在的大语言模型的reward一般都是加在最后一个token上导致的。
+我们需要使用一个实时计算的filter来过滤一些sample，过滤的算法我写好了代码，需要你整合成一个完整的代码。
+
+filter流程
+1. 读取jsonl
+读取jsonl文件后，按照group分组，外部可以指定args的parser参数，来只取其中某一步，或者其中的连续几步。并记录这个按步读取的原始集合的大小n，以及这个集合中kept部分的sample数据量。
+2. 取子集
+外部传参过滤是否只选择正确的那一部分，以及是否只选择kept的部分。再取一次子集，记录大小，n_subset
+3. 计算指标
+代码在128个cpu的节点启动，本身有大量GPU，计算时能够使用多进程加速，要求使用多进程加速。
+计算的过滤统计指标如下，计算方法需要参考我之后给你的代码。那些代码的逻辑框架你也可以参考，但是算法计算的细节你必须对齐。
+我下面给你的三份代码含有细节的计算方法，你去参考他计算所有需要的指标，特别是基于GPU的计算内容需要你计算好embedding向量之后，再去计算指标，不要自己简单化了。你直接使用vllm在一张显卡上启动好一个embedding模型去计算就好了。
+三份代码的启动脚本文件：
+*********************
+#!/usr/bin/env bash
+set -euo pipefail
+# JSONL
+#   └─(Stage1: build_features_preprocess.py)
+#       ├─ features.parquet      # 样本级 + 原有语言指标 + 分段统计
+#       ├─ segments.parquet      # 句子级 (text + marker + lang)
+#       └─ meta_preprocess.json
+
+#   └─(Stage2: build_features_embedding.py)
+#       ├─ sentence_embeddings.parquet  # 句子级 (sample_idx,section_idx,sent_idx,emb)
+#       └─ meta_embedding.json
+
+#   └─(Stage3: build_features_analysis.py)
+#       ├─ features_analysis.parquet    # 在 features.parquet 基础上加 embedding 分析指标
+#       └─ meta_analysis.json
+
+JSONL="/remote-home1/yli/Workspace/BandPO/data/records/RLtraining_DapoMathDataset_DeepseekR1_1.5B/grpo_plus_ray_trgppo01_tokenmean_df/split_by_filter_state/sampled_010percent.jsonl"
+OUT_DIR="$BandPODir/data/records/RLtraining_DapoMathDataset_DeepseekR1_1.5B/grpo_plus_ray_trgppo01_tokenmean_df/build_features_steps_sample010"
+
+EmbeddingModelPath="/remote-home1/yli/Workspace/BandPO/data/models/BAAI/bge-m3"
+
+# # Stage1: 预处理 + 基础特征
+echo "[RUN] Stage1: preprocess from JSONL -> features.parquet + segments.parquet"
+python build_features_preprocess.py \
+  --jsonl "$JSONL" \
+  --out-dir "$OUT_DIR" \
+  --procs 128 \
+  --chunk-lines 20000 \
+  --correct-key "reward_extra_infos.acc" \
+  --snapshot-keys "epoch,global_step,uid,filter_state,prompt_text,response_text,prompt_len_tokens,response_len_tokens,total_len_tokens,reward_seq_sum,reward_extra_infos.acc"
+
+# Stage2: sentence embedding (vLLM)
+echo "[RUN] Stage2: compute sentence embeddings with vLLM"
+python build_features_embedding_vllm.py \
+  --segments-parquet "$OUT_DIR/segments.parquet" \
+  --out-dir "$OUT_DIR" \
+  --model-name "$EmbeddingModelPath" \
+  --tensor-parallel-size 1 \
+  --dtype "bfloat16" \
+  --gpu-memory-utilization 0.90 \
+  --trust-remote-code \
+  --enforce-eager
+
+# Stage3: embedding-based 分析
+echo "[RUN] Stage3: fast analysis with embeddings"
+python build_features_analysis_fast.py \
+  --preprocess-dir "$OUT_DIR" \
+  --embed-dir "$OUT_DIR" \
+  --out-dir "$OUT_DIR" \
+  --procs 120 \
+  --dup-threshold 0.90 \
+  --cluster-threshold 0.85 \
+  --plateau-min-len 3 \
+  --max-sent-per-sample 128 \
+  --rambling-weight-self 1.0 \
+  --rambling-weight-dup 1.0 \
+  --rambling-weight-loop 1.0 \
+  --rambling-weight-plateau 1.0 \
+  --rambling-weight-lang 0.1 \
+  --rambling-loopiness-cap 5.0 \
+  --rambling-plateau-k 4
+
+echo "[DONE] All stages finished. Outputs are under $OUT_DIR"
+*********************
+执行的第一个计算指标文件：主要是分割句子，计算一些cpu消耗型指标
+*****************
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_features_preprocess.py
+
+Stage 1: 从超大 JSONL 构建基础特征 + 文本切分（section/sentence）+ discourse marker + 句子级语言信息。
+
+输出到 --out-dir:
+  - features.parquet : 每个 sample 一行（沿用你原来的 features 设计 + 新增字段）
+  - segments.parquet : 每个 sentence 一行（后续 embedding/分析用）
+  - meta_preprocess.json : 元信息（schema/version/参数等）
+
+设计要点：
+- 单次顺序扫描 JSONL，先记录 (line_no, offset, length)。
+- 多进程 worker，各自 reopen 源文件，用 pread() 按 offset 解析 JSON，并计算特征。
+- 保留原先 build_features_from_jsonl 的所有 feature 计算逻辑。
+- 新增分段/分句/marker/language 信息，写入 segments.parquet。
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+import argparse, json, os, sys, time, math, hashlib, re
+from typing import Any, Dict, List, Tuple, Optional
+import multiprocessing as mp
+
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm  # 新增：进度条
+# ---------- fast json ----------
+try:
+    import orjson
+    def _json_loads(b: bytes):
+        return orjson.loads(b)
+except Exception:
+    import json as _json
+    def _json_loads(b: bytes):
+        return _json.loads(b.decode("utf-8", errors="replace"))
+
+# ---------- text metrics (沿用你的实现) ----------
+import unicodedata, zlib
+
+REPL_CHAR = "\uFFFD"
+
+# ---------- Chinese detector ----------
+_CHN_RE = re.compile(
+    r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\u3000-\u303F"
+    r"\U00020000-\U0002A6DF\U0002A700-\U0002B73F\U0002B740-\U0002B81F"
+    r"\U0002B820-\U0002CEAF\U0002CEB0-\U0002EBEF]"
+)
+
+def contains_chinese(s: str) -> bool:
+    if not s:
+        return False
+    return bool(_CHN_RE.search(s))
+
+def text_metrics(s: str) -> Dict[str, float]:
+    """沿用你原来的字符级指标."""
+    try:
+        b = s.encode("utf-8", errors="replace")
+        cnt = len(s)
+        if cnt == 0:
+            return {
+                "resp_char_len": 0.0, "resp_byte_len": 0.0, "non_ascii_ratio": 0.0,
+                "replacement_char_ratio": 0.0, "control_private_unassigned_ratio": 0.0,
+                "repeat_char_run_max": 0.0, "repeat_word_run_max": 0.0, "unique_word_ratio": 0.0,
+                "top1_word_prop": 0.0, "trigram_repeat_ratio": 0.0, "compress_ratio": 1.0,
+                "char_entropy_bits_per_char": 0.0,
+            }
+
+        non_ascii = sum(1 for ch in s if ord(ch) > 127)
+        repl_ratio = s.count(REPL_CHAR) / cnt
+        bad_cat = 0
+        for ch in s:
+            cat = unicodedata.category(ch)
+            if cat.startswith("C") or cat in {"Co", "Cs", "Cn"}:
+                bad_cat += 1
+        cpu_ratio = bad_cat / cnt
+
+        # char run
+        max_char_run = 1
+        run = 1
+        for i in range(1, cnt):
+            if s[i] == s[i-1]:
+                run += 1
+                if run > max_char_run:
+                    max_char_run = run
+            else:
+                run = 1
+
+        words = [w for w in s.split() if w]
+        if not words:
+            uniq_ratio = 0.0
+            top1_prop = 0.0
+            max_word_run = float(max_char_run)
+            trigram_rep = 0.0
+        else:
+            from collections import Counter
+            wlen = len(words)
+            uniq_ratio = len(set(words)) / wlen
+            wc = Counter(words)
+            top1_prop = wc.most_common(1)[0][1] / wlen
+
+            max_word_run = 1
+            run = 1
+            for i in range(1, wlen):
+                if words[i] == words[i-1]:
+                    run += 1
+                    if run > max_word_run:
+                        max_word_run = run
+                else:
+                    run = 1
+
+            if wlen >= 3:
+                tgs = [tuple(words[i:i+3]) for i in range(wlen-2)]
+                c3 = Counter(tgs)
+                trigram_rep = sum(v for v in c3.values() if v > 1) / len(tgs)
+            else:
+                trigram_rep = 0.0
+
+        try:
+            comp = zlib.compress(b, level=6)
+            comp_ratio = len(comp) / max(1, len(b))
+        except Exception:
+            comp_ratio = 1.0
+
+        from collections import Counter
+        cc = Counter(s)
+        probs = [c / cnt for c in cc.values()]
+        ent = -sum(p * math.log2(p) for p in probs)
+
+        return {
+            "resp_char_len": float(cnt),
+            "resp_byte_len": float(len(b)),
+            "non_ascii_ratio": float(non_ascii / cnt),
+            "replacement_char_ratio": float(repl_ratio),
+            "control_private_unassigned_ratio": float(cpu_ratio),
+            "repeat_char_run_max": float(max_char_run),
+            "repeat_word_run_max": float(max_word_run),
+            "unique_word_ratio": float(uniq_ratio),
+            "top1_word_prop": float(top1_prop),
+            "trigram_repeat_ratio": float(trigram_rep),
+            "compress_ratio": float(comp_ratio),
+            "char_entropy_bits_per_char": float(ent),
+        }
+    except Exception:
+        return {
+            "resp_char_len": np.nan, "resp_byte_len": np.nan, "non_ascii_ratio": np.nan,
+            "replacement_char_ratio": np.nan, "control_private_unassigned_ratio": np.nan,
+            "repeat_char_run_max": np.nan, "repeat_word_run_max": np.nan, "unique_word_ratio": np.nan,
+            "top1_word_prop": np.nan, "trigram_repeat_ratio": np.nan, "compress_ratio": np.nan,
+            "char_entropy_bits_per_char": np.nan,
+        }
+
+# ---------- nested key helper ----------
+def get_nested(d: Dict[str, Any], path: str, default: Any=None) -> Any:
+    cur: Any = d
+    for k in path.split("."):
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return default
+    return cur
+
+def classify_record(obj: Dict[str, Any], correct_key: Optional[str], use_reward_sum_fallback=True) -> int:
+    """1=correct, 0=wrong, 2=no_judge."""
+    v = None
+    if correct_key:
+        v = get_nested(obj, correct_key, None)
+    if v is None:
+        rei = obj.get("reward_extra_infos") or obj.get("reward_extra_infos_dict")
+        if isinstance(rei, dict):
+            for k in ["is_correct","correct","equal","any_of_three","pass","ok","acc","accuracy","label"]:
+                if k in rei:
+                    v = rei[k]
+                    break
+    if v is None and use_reward_sum_fallback:
+        rs = obj.get("reward_seq_sum", None)
+        if isinstance(rs, (int,float)):
+            v = (rs > 0)
+
+    def _to_bool(x):
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, (int,float)):
+            return x > 0
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s in {"true","t","yes","y","correct","right","pass","ok","passed","success"}:
+                return True
+            if s in {"false","f","no","n","wrong","incorrect","fail","failed"}:
+                return False
+            try:
+                return float(s) > 0
+            except Exception:
+                return None
+        return None
+
+    b = _to_bool(v)
+    if b is None:
+        return 2
+    return 1 if b else 0
+
+def neg(x):
+    try:
+        xf = float(x)
+        if math.isfinite(xf):
+            return -xf
+        return np.nan
+    except Exception:
+        return np.nan
+
+def sanitize_snap_col(path: str) -> str:
+    return "snap__" + path.replace(".", "__")
+
+@dataclass
+class BuildConfig:
+    jsonl: Path
+    out_dir: Path
+    procs: int
+    chunk_lines: int
+    correct_key: Optional[str]
+    snapshot_keys: List[str]
+    compute_sha256: bool
+    min_lang_chars: int
+
+SCHEMA_VERSION = 2  # 新 schema
+
+# ---------- discourse markers (多语言) ----------
+# SELF_REFLECT / CONTRAST / CONCLUDE
+SELF_REFLECT_PATTERNS = [
+    r"\bwait\b",
+    r"\bwait a second\b",
+    r"\bhold on\b",
+    r"\bhang on\b",
+    r"\blet me think\b",
+    r"\bgive me a moment\b",
+    r"\bjust a second\b",
+    r"等一下",
+    r"等一等",
+    r"先等等",
+    r"稍等",
+    r"moment mal",
+    r"einen moment",
+    r"подожди",
+    r"подождите",
+    r"секундочку",
+]
+
+CONTRAST_PATTERNS = [
+    r"\bhowever\b",
+    r"\bbut\b",
+    r"\bon the other hand\b",
+    r"\bnevertheless\b",
+    r"\bnonetheless\b",
+    r"但是",
+    r"然而",
+    r"不过",
+    r"另一方面",
+    r"doch",
+    r"aber",
+    r"jedoch",
+    r"однако",
+]
+
+CONCLUDE_PATTERNS = [
+    r"\bso\b",
+    r"\btherefore\b",
+    r"\bthus\b",
+    r"\bhence\b",
+    r"\bin conclusion\b",
+    r"\bas a result\b",
+    r"所以",
+    r"因此",
+    r"综上",
+    r"由此可见",
+    r"itak",  # итак 的常见拉丁转写
+    r"итак",
+    r"значит",
+]
+
+SELF_REFLECT_RE = re.compile("|".join(SELF_REFLECT_PATTERNS), re.IGNORECASE)
+CONTRAST_RE     = re.compile("|".join(CONTRAST_PATTERNS),     re.IGNORECASE)
+CONCLUDE_RE     = re.compile("|".join(CONCLUDE_PATTERNS),     re.IGNORECASE)
+
+# 单独标记 "wait-like"（更细一点）
+WAITLIKE_RE = re.compile(r"\bwait\b|\bhold on\b|\bhang on\b|等一下|稍等|подожди|подождите", re.IGNORECASE)
+
+# marker bitmask: bit0=self_reflect, bit1=contrast, bit2=conclude
+MARKER_SELF_REFLECT = 1
+MARKER_CONTRAST     = 2
+MARKER_CONCLUDE     = 4
+
+def detect_markers(text: str) -> Tuple[int, int, int, int]:
+    """返回 (mask, self_flag, contrast_flag, conclude_flag, waitlike_flag)."""
+    mask = 0
+    sr = 1 if SELF_REFLECT_RE.search(text) else 0
+    ct = 1 if CONTRAST_RE.search(text) else 0
+    cd = 1 if CONCLUDE_RE.search(text) else 0
+    if sr:
+        mask |= MARKER_SELF_REFLECT
+    if ct:
+        mask |= MARKER_CONTRAST
+    if cd:
+        mask |= MARKER_CONCLUDE
+    waitlike = 1 if WAITLIKE_RE.search(text) else 0
+    return mask, sr, ct, cd, waitlike
+
+# ---------- sentence segmentation (pysbd) ----------
+try:
+    import pysbd
+    _SEGMENTER = pysbd.Segmenter(language="en", clean=False, char_span=True)
+    _SEGMENTER_CHARSPAN = True
+except Exception:
+    try:
+        import pysbd  # type: ignore
+        _SEGMENTER = pysbd.Segmenter(language="en", clean=False, char_span=False)
+        _SEGMENTER_CHARSPAN = False
+    except Exception:
+        _SEGMENTER = None
+        _SEGMENTER_CHARSPAN = False
+
+def split_sections(text: str) -> List[Tuple[str, int, int]]:
+    """
+    按 \n+ 切成 section。
+    每个 section 包含前面的 \n run。
+    返回 list[(section_text, start_idx, end_idx)]，end_idx 为原字符串切片的 end（不包含）。
+    """
+    if not text:
+        return []
+    n = len(text)
+    sections: List[Tuple[str, int, int]] = []
+    start = 0
+    i = 0
+    while i < n:
+        if text[i] == "\n":
+            j = i
+            while j < n and text[j] == "\n":
+                j += 1
+            # [i, j) 是一段连续的 \n，属于前一个 section 的结尾
+            sec_text = text[start:j]
+            sections.append((sec_text, start, j))
+            start = j
+            i = j
+        else:
+            i += 1
+    if start < n:
+        sections.append((text[start:n], start, n))
+    if not sections:
+        return [(text, 0, n)]
+    return sections
+
+def split_sentences(section_text: str, sec_start: int) -> List[Tuple[str, int, int]]:
+    """
+    在一个 section 内用 pysbd 切分 sentence。
+    返回 list[(sent_text, global_start, global_end)]。
+    """
+    if not section_text:
+        return []
+    if _SEGMENTER is None:
+        # 没有 pysbd 时，整个 section 当成一个句子
+        return [(section_text, sec_start, sec_start + len(section_text))]
+
+    try:
+        spans = _SEGMENTER.segment(section_text)
+        results: List[Tuple[str, int, int]] = []
+        if spans and _SEGMENTER_CHARSPAN and hasattr(spans[0], "start"):
+            # 新版 pysbd: 返回带 start/end 的对象
+            for sp in spans:
+                s = getattr(sp, "start")
+                e = getattr(sp, "end")
+                if not isinstance(s, int) or not isinstance(e, int):
+                    continue
+                global_s = sec_start + s
+                global_e = sec_start + e
+                sent_text = section_text[s:e]
+                results.append((sent_text, global_s, global_e))
+        else:
+            # 老版：只返回字符串，手动对齐
+            pos = 0
+            for sent in spans:
+                if not isinstance(sent, str):
+                    continue
+                idx = section_text.find(sent, pos)
+                if idx == -1:
+                    idx = pos
+                s = idx
+                e = idx + len(sent)
+                global_s = sec_start + s
+                global_e = sec_start + e
+                results.append((sent, global_s, global_e))
+                pos = e
+        if not results:
+            return [(section_text, sec_start, sec_start + len(section_text))]
+        return results
+    except Exception:
+        return [(section_text, sec_start, sec_start + len(section_text))]
+
+# ---------- sentence language detection ----------
+try:
+    import langid
+    _HAS_LANGID = True
+    # 可选：限制语言集合，加速 + 稳一点
+    langid.set_languages(['en', 'zh', 'de', 'ru', 'it', 'fr', 'es', 'ja'])
+except Exception:
+    _HAS_LANGID = False
+
+def detect_lang(text: str, min_len: int = 5) -> Tuple[str, float]:
+    """
+    用 langid 检测句子主语言。
+    返回 (lang_code, confidence)，如果无法检测则 ('unk', 0.0)。
+    对特别短的句子/噪声，直接返回 unk。
+    """
+    if not text or len(text) < min_len or not _HAS_LANGID:
+        return "unk", 0.0
+    try:
+        lang, conf = langid.classify(text)
+        return str(lang), float(conf)
+    except Exception:
+        return "unk", 0.0
+
+# ---------- worker ----------
+def _worker_process(jsonl_path: str,
+                    offsets: List[Tuple[int,int,int]],
+                    correct_key: Optional[str],
+                    snapshot_keys: List[str],
+                    min_lang_chars: int) -> Dict[str, Any]:
+    """
+    offsets: list of (line_no, offset, length)
+    返回：
+      - df_samples: 每样本一行
+      - df_segments: 每 sentence 一行
+    """
+    fd = os.open(jsonl_path, os.O_RDONLY)
+    rows_samples: List[Dict[str, Any]] = []
+    rows_segments: List[Dict[str, Any]] = []
+
+    snap_cols = [(k, sanitize_snap_col(k)) for k in snapshot_keys]
+
+    for line_no, off, ln in offsets:
+        try:
+            b = os.pread(fd, ln, off)
+        except Exception:
+            obj = None
+        else:
+            try:
+                obj = _json_loads(b)
+            except Exception:
+                obj = None
+
+        sample_idx = line_no - 1  # 全局 sample 索引（0-based）
+
+        rec: Dict[str, Any] = {
+            "sample_idx": np.int64(sample_idx),
+            "line_no": np.int64(line_no),
+            "byte_offset": np.int64(off),
+            "byte_len": np.int32(ln),
+            "valid": np.int8(1 if isinstance(obj, dict) else 0),
+            "global_step": np.int32(get_nested(obj, "global_step", -1)) if obj else np.int32(-1),
+            "uid": str(obj.get("uid")) if (obj and "uid" in obj) else "",
+            "kept_flag": np.int8(1 if (obj and obj.get("filter_state")=="kept")
+                             else (0 if (obj and obj.get("filter_state")=="dropped") else -1)),
+            "ce_self_seq_mean": np.float32(neg(obj.get("old_logprob_mean") if obj else None)),
+            "ce_self_seq_sum":  np.float32(neg(obj.get("old_logprob_sum") if obj else None)),
+            "ce_ref_seq_mean":  np.float32(neg(obj.get("ref_logprob_mean") if obj else None)),
+            "ce_ref_seq_sum":   np.float32(neg(obj.get("ref_logprob_sum") if obj else None)),
+            "reward_seq_sum":   np.float32(obj.get("reward_seq_sum") if obj else np.nan),
+            "kl_seq_mean_log_ratio": np.float32(obj.get("kl_seq_mean_log_ratio") if obj else np.nan),
+            "entropy_seq_mean":      np.float32(obj.get("entropy_seq_mean") if obj else np.nan),
+            "response_len_tokens":   np.float32(obj.get("response_len_tokens") if obj else np.nan),
+            "cls_id": np.int8(classify_record(obj, correct_key=correct_key) if obj else 2),
+        }
+
+        rt = obj.get("response_text") if isinstance(obj, dict) else None
+        pt = obj.get("prompt_text") if isinstance(obj, dict) else None
+
+        # 是否包含中文（prompt/response）
+        if isinstance(rt, str) or isinstance(pt, str):
+            has_cn = (contains_chinese(rt) if isinstance(rt, str) else False) \
+                     or (contains_chinese(pt) if isinstance(pt, str) else False)
+            rec["contain_chinese"] = np.int8(1 if has_cn else 0)
+        else:
+            rec["contain_chinese"] = np.int8(-1)
+
+        # 文本级指标（response）
+        if isinstance(rt, str):
+            tm = text_metrics(rt)
+        else:
+            tm = {k: np.nan for k in [
+                "resp_char_len","resp_byte_len","non_ascii_ratio","replacement_char_ratio",
+                "control_private_unassigned_ratio","repeat_char_run_max","repeat_word_run_max",
+                "unique_word_ratio","top1_word_prop","trigram_repeat_ratio","compress_ratio",
+                "char_entropy_bits_per_char"
+            ]}
+        for k, v in tm.items():
+            rec[k] = np.float32(v)
+
+        # snapshots
+        if isinstance(obj, dict):
+            for path, col in snap_cols:
+                try:
+                    val = get_nested(obj, path, None)
+                except Exception:
+                    val = None
+                rec[col] = val
+        else:
+            for _, col in snap_cols:
+                rec[col] = None
+
+        # ---------- section / sentence 切分 & marker & language ----------
+        num_sections = 0
+        num_sentences = 0
+        num_marker_sent = 0
+        num_self_sent = 0
+        num_contrast_sent = 0
+        num_conclude_sent = 0
+        num_marker_sec = 0
+
+        if isinstance(rt, str) and rt:
+            sections = split_sections(rt)
+            num_sections = len(sections)
+
+            for sec_idx, (sec_text, sec_start, sec_end) in enumerate(sections):
+                section_has_marker = False
+                sent_list = split_sentences(sec_text, sec_start)
+                if not sent_list:
+                    sent_list = [(sec_text, sec_start, sec_end)]
+                for local_sent_idx, (sent_text, global_s, global_e) in enumerate(sent_list):
+                    sent_idx = num_sentences  # 全局 sentence 序号（在该 response 内）
+
+                    marker_mask, sr, ct, cd, waitlike = detect_markers(sent_text)
+                    if marker_mask != 0:
+                        section_has_marker = True
+                        num_marker_sent += 1
+                    if sr:
+                        num_self_sent += 1
+                    if ct:
+                        num_contrast_sent += 1
+                    if cd:
+                        num_conclude_sent += 1
+
+                    lang_main, lang_conf = detect_lang(sent_text, min_len=min_lang_chars)
+
+                    sent_char_len = float(len(sent_text))
+
+                    rows_segments.append({
+                        "sample_idx": np.int64(sample_idx),
+                        "line_no": np.int64(line_no),
+                        "section_idx": np.int32(sec_idx),
+                        "sent_idx": np.int32(sent_idx),
+                        "section_local_sent_idx": np.int32(local_sent_idx),
+                        "char_start": np.int32(global_s),
+                        "char_end": np.int32(global_e),
+                        "sent_char_len": np.float32(sent_char_len),
+                        "text": sent_text,
+                        "marker_mask": np.int8(marker_mask),
+                        "marker_self_reflect": np.int8(sr),
+                        "marker_contrast": np.int8(ct),
+                        "marker_conclude": np.int8(cd),
+                        "marker_wait_like": np.int8(waitlike),
+                        "lang_main": lang_main,
+                        "lang_conf": np.float32(lang_conf),
+                    })
+                    num_sentences += 1
+
+                if section_has_marker:
+                    num_marker_sec += 1
+
+        rec["num_sections"] = np.int32(num_sections)
+        rec["num_sentences"] = np.int32(num_sentences)
+        rec["num_marker_sentences"] = np.int32(num_marker_sent)
+        rec["num_self_reflect_sentences"] = np.int32(num_self_sent)
+        rec["num_contrast_sentences"] = np.int32(num_contrast_sent)
+        rec["num_conclude_sentences"] = np.int32(num_conclude_sent)
+        rec["num_marker_sections"] = np.int32(num_marker_sec)
+
+        rows_samples.append(rec)
+
+    os.close(fd)
+
+    df_samples = pd.DataFrame(rows_samples)
+    df_segments = pd.DataFrame(rows_segments)
+
+    # dtypes 收紧
+    if not df_samples.empty:
+        df_samples["sample_idx"] = df_samples["sample_idx"].astype(np.int64)
+        df_samples["line_no"] = df_samples["line_no"].astype(np.int64)
+        df_samples["byte_offset"] = df_samples["byte_offset"].astype(np.int64)
+        df_samples["byte_len"] = df_samples["byte_len"].astype(np.int32)
+        df_samples["global_step"] = df_samples["global_step"].astype(np.int32)
+        df_samples["kept_flag"] = df_samples["kept_flag"].astype(np.int8)
+        df_samples["cls_id"] = df_samples["cls_id"].astype(np.int8)
+        df_samples["contain_chinese"] = df_samples["contain_chinese"].astype(np.int8)
+        for col in [
+            "num_sections","num_sentences","num_marker_sentences",
+            "num_self_reflect_sentences","num_contrast_sentences",
+            "num_conclude_sentences","num_marker_sections"
+        ]:
+            df_samples[col] = df_samples[col].astype(np.int32)
+
+    if not df_segments.empty:
+        df_segments["sample_idx"] = df_segments["sample_idx"].astype(np.int64)
+        df_segments["line_no"] = df_segments["line_no"].astype(np.int64)
+        df_segments["section_idx"] = df_segments["section_idx"].astype(np.int32)
+        df_segments["sent_idx"] = df_segments["sent_idx"].astype(np.int32)
+        df_segments["section_local_sent_idx"] = df_segments["section_local_sent_idx"].astype(np.int32)
+        df_segments["char_start"] = df_segments["char_start"].astype(np.int32)
+        df_segments["char_end"] = df_segments["char_end"].astype(np.int32)
+        df_segments["sent_char_len"] = df_segments["sent_char_len"].astype(np.float32)
+        df_segments["marker_mask"] = df_segments["marker_mask"].astype(np.int8)
+        df_segments["marker_self_reflect"] = df_segments["marker_self_reflect"].astype(np.int8)
+        df_segments["marker_contrast"] = df_segments["marker_contrast"].astype(np.int8)
+        df_segments["marker_conclude"] = df_segments["marker_conclude"].astype(np.int8)
+        df_segments["marker_wait_like"] = df_segments["marker_wait_like"].astype(np.int8)
+        df_segments["lang_conf"] = df_segments["lang_conf"].astype(np.float32)
+
+    return {"samples": df_samples, "segments": df_segments}
+
+def _worker_entry(args):
+    return _worker_process(*args)
+
+# ---------- scan offsets ----------
+# def _scan_offsets(jsonl: Path, chunk_lines: int, compute_sha256: bool):
+#     offsets: List[Tuple[int,int,int]] = []
+#     chunks: List[List[Tuple[int,int,int]]] = []
+#     hasher = hashlib.sha256() if compute_sha256 else None
+
+#     with jsonl.open("rb", buffering=1024*1024) as f:
+#         line_no = 0
+#         while True:
+#             off = f.tell()
+#             line = f.readline()
+#             if not line:
+#                 if offsets:
+#                     chunks.append(offsets)
+#                     offsets = []
+#                 break
+#             line_no += 1
+#             if hasher:
+#                 hasher.update(line)
+#             ln = len(line)
+#             offsets.append((line_no, off, ln))
+#             if len(offsets) >= chunk_lines:
+#                 chunks.append(offsets)
+#                 offsets = []
+#     sha256 = hasher.hexdigest() if hasher else ""
+#     stat = jsonl.stat()
+#     return chunks, sha256, stat.st_size, int(stat.st_mtime)
+def _scan_offsets(jsonl: Path, chunk_lines: int, compute_sha256: bool):
+    """
+    Sequentially iterate binary lines to get (line_no, offset, length).
+    Also compute sha256 if requested (in-stream).
+
+    这里加一个按字节数的 tqdm 进度条，方便观察扫描进度和预估时间。
+    """
+    offsets: List[Tuple[int,int,int]] = []
+    chunks: List[List[Tuple[int,int,int]]] = []
+    hasher = hashlib.sha256() if compute_sha256 else None
+
+    # 先拿到文件大小，用于 tqdm 的 total
+    stat = jsonl.stat()
+    total_bytes = stat.st_size
+
+    with jsonl.open("rb", buffering=1024*1024) as f:
+        line_no = 0
+        processed_bytes = 0
+
+        pbar = tqdm(
+            total=total_bytes,
+            desc="[Stage1] Scanning JSONL",
+            unit="B",
+            unit_scale=True,
+        )
+
+        while True:
+            off = f.tell()
+            line = f.readline()
+            if not line:
+                if offsets:
+                    chunks.append(offsets)
+                    offsets = []
+                break
+
+            line_no += 1
+            if hasher:
+                hasher.update(line)
+            ln = len(line)
+            processed_bytes += ln
+            pbar.update(ln)
+
+            offsets.append((line_no, off, ln))
+            if len(offsets) >= chunk_lines:
+                chunks.append(offsets)
+                offsets = []
+
+        pbar.close()
+
+    sha256 = hasher.hexdigest() if hasher else ""
+    # stat 前面已经取过，这里直接用
+    return chunks, sha256, stat.st_size, int(stat.st_mtime)
+
+# ---------- main ----------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--jsonl", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 8)//2))
+    ap.add_argument("--chunk-lines", type=int, default=20000)
+    ap.add_argument("--correct-key", type=str, default=None,
+                    help="Dot path for correctness label, e.g., reward_extra_infos.acc")
+    ap.add_argument("--snapshot-keys", type=str, default="epoch,global_step,uid,filter_state,prompt_text,response_text,prompt_len_tokens,response_len_tokens,total_len_tokens,reward_seq_sum,reward_extra_infos.acc",
+                    help="Comma separated dot-keys to snapshot for fast export.")
+    ap.add_argument("--compute-sha256", action="store_true",
+                    help="Compute sha256 of source file for strong validation (costly on very large files).")
+    ap.add_argument("--min-lang-chars", type=int, default=5,
+                    help="Min char length of a sentence before running langid (shorter -> 'unk').")
+    args = ap.parse_args()
+
+    cfg = BuildConfig(
+        jsonl=args.jsonl,
+        out_dir=args.out_dir,
+        procs=int(args.procs),
+        chunk_lines=int(args.chunk_lines),
+        correct_key=args.correct_key,
+        snapshot_keys=[s.strip() for s in args.snapshot_keys.split(",") if s.strip()],
+        compute_sha256=bool(args.compute_sha256),
+        min_lang_chars=int(args.min_lang_chars),
+    )
+
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    samples_path = cfg.out_dir / "features.parquet"
+    segments_path = cfg.out_dir / "segments.parquet"
+    meta_path = cfg.out_dir / "meta_preprocess.json"
+
+    print(f"[Stage1] Scanning offsets in JSONL: {cfg.jsonl}")
+    t0 = time.time()
+    chunks, sha256, fsize, mtime = _scan_offsets(cfg.jsonl, cfg.chunk_lines, cfg.compute_sha256)
+    n_lines = sum(len(c) for c in chunks)
+    print(f"[Stage1] Found {n_lines:,} lines, {len(chunks)} chunks; scan took {time.time()-t0:.1f}s")
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    print(f"[Stage1] Processing chunks with {cfg.procs} processes ...")
+    t1 = time.time()
+    writer_samples = None
+    writer_segments = None
+    n_rows_samples = 0
+    n_rows_segments = 0
+
+    start_method = "spawn" if sys.platform == "win32" else "fork"
+    ctx = mp.get_context(start_method)
+    tasks = [(str(cfg.jsonl), offs, cfg.correct_key, cfg.snapshot_keys, cfg.min_lang_chars) for offs in chunks]
+
+    # with ctx.Pool(processes=cfg.procs) as pool:
+    #     for i, ret in enumerate(pool.imap_unordered(_worker_entry, tasks, chunksize=1)):
+    #         df_s = ret["samples"]
+    #         df_seg = ret["segments"]
+
+    #         if not df_s.empty:
+    #             table_s = pa.Table.from_pandas(df_s, preserve_index=False)
+    #             if writer_samples is None:
+    #                 writer_samples = pq.ParquetWriter(samples_path, table_s.schema, compression="zstd", version="2.6")
+    #             writer_samples.write_table(table_s)
+    #             n_rows_samples += len(df_s)
+
+    #         if not df_seg.empty:
+    #             table_seg = pa.Table.from_pandas(df_seg, preserve_index=False)
+    #             if writer_segments is None:
+    #                 writer_segments = pq.ParquetWriter(segments_path, table_seg.schema, compression="zstd", version="2.6")
+    #             writer_segments.write_table(table_seg)
+    #             n_rows_segments += len(df_seg)
+
+    #         if (i+1) % 5 == 0:
+    #             print(f"  [Stage1] processed {i+1}/{len(chunks)} chunks; samples={n_rows_samples:,}, segments={n_rows_segments:,}")
+    with ctx.Pool(processes=cfg.procs) as pool:
+        # 用 tqdm 包裹 imap_unordered，按 chunk 显示进度和 ETA
+        for i, ret in enumerate(
+            tqdm(
+                pool.imap_unordered(_worker_entry, tasks, chunksize=1),
+                total=len(tasks),
+                desc="[Stage1] Processing chunks",
+            )
+        ):
+            df_s = ret["samples"]
+            df_seg = ret["segments"]
+
+            if not df_s.empty:
+                table_s = pa.Table.from_pandas(df_s, preserve_index=False)
+                if writer_samples is None:
+                    writer_samples = pq.ParquetWriter(samples_path, table_s.schema, compression="zstd", version="2.6")
+                writer_samples.write_table(table_s)
+                n_rows_samples += len(df_s)
+
+            if not df_seg.empty:
+                table_seg = pa.Table.from_pandas(df_seg, preserve_index=False)
+                if writer_segments is None:
+                    writer_segments = pq.ParquetWriter(segments_path, table_seg.schema, compression="zstd", version="2.6")
+                writer_segments.write_table(table_seg)
+                n_rows_segments += len(df_seg)
+
+            # 可选：保留原来每 5 个 chunk 打一行 summary 的行为
+            if (i + 1) % 5 == 0:
+                print(
+                    f"  [Stage1] processed {i+1}/{len(chunks)} chunks; "
+                    f"samples={n_rows_samples:,}, segments={n_rows_segments:,}"
+                )
+
+    if writer_samples is not None:
+        writer_samples.close()
+    if writer_segments is not None:
+        writer_segments.close()
+
+    print(f"[Stage1] Wrote samples features: {samples_path} (rows={n_rows_samples:,})")
+    print(f"[Stage1] Wrote segments (sentence-level): {segments_path} (rows={n_rows_segments:,})")
+    print(f"[Stage1] Total time: {time.time()-t1:.1f}s")
+
+    meta = {
+        "schema_version": SCHEMA_VERSION,
+        "source_jsonl": str(cfg.jsonl),
+        "source_size": fsize,
+        "source_mtime": mtime,
+        "source_sha256": sha256,
+        "samples_path": str(samples_path),
+        "segments_path": str(segments_path),
+        "rows_samples": n_rows_samples,
+        "rows_segments": n_rows_segments,
+        "snapshot_keys": cfg.snapshot_keys,
+        "snapshot_columns": {k: sanitize_snap_col(k) for k in cfg.snapshot_keys},
+        "build_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "args": {
+            "procs": cfg.procs,
+            "chunk_lines": cfg.chunk_lines,
+            "correct_key": cfg.correct_key,
+            "compute_sha256": cfg.compute_sha256,
+            "min_lang_chars": cfg.min_lang_chars,
+        },
+    }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[Stage1] Wrote meta: {meta_path}")
+
+    print("[Stage1 Summary]")
+    print(f"  samples rows = {n_rows_samples:,}")
+    print(f"  segments rows = {n_rows_segments:,}")
+
+if __name__ == "__main__":
+    main()
+****************
+第二个代码：主要是计算embedding vector：
+******************
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_features_embedding.py  (Stage 2, vLLM backend)
+
+从 Stage1 生成的 segments.parquet 中读取 sentence 文本，
+使用 vLLM 的 LLM(task="embed") 一次性把每个 row-group 的所有句子
+塞进 vLLM 的 embed()，让 vLLM 自己做 batching / 调度。
+
+输出:
+  - sentence_embeddings.parquet: 每个 sentence 一行
+      columns: [sample_idx, section_idx, sent_idx, emb]
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse, os, time, json
+from typing import List, Any
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from vllm import LLM  # vLLM 离线推理 API  :contentReference[oaicite:1]{index=1}
+from tqdm.auto import tqdm  # 新增：进度条
+
+def extract_embedding_from_output(output: Any) -> List[float]:
+    """
+    vLLM embed() 的每个返回元素是 EmbeddingRequestOutput：
+      - output.outputs 可能是 PoolingOutput 或 [PoolingOutput]
+      - PoolingOutput.embedding 已经封装为 list[float]（兼容旧 API）:contentReference[oaicite:2]{index=2}
+      - 或者可以用 .data.tolist()
+    做一个稍微鲁棒一点的抽取。
+    """
+    outs = getattr(output, "outputs", None)
+    if outs is None:
+        return []
+
+    # 可能是单个 PoolingOutput
+    if hasattr(outs, "embedding"):
+        try:
+            return list(outs.embedding)
+        except Exception:
+            pass
+    if hasattr(outs, "data"):
+        try:
+            return outs.data.tolist()
+        except Exception:
+            pass
+
+    # 可能是 list[PoolingOutput]
+    if isinstance(outs, (list, tuple)) and len(outs) > 0:
+        o0 = outs[0]
+        if hasattr(o0, "embedding"):
+            try:
+                return list(o0.embedding)
+            except Exception:
+                pass
+        if hasattr(o0, "data"):
+            try:
+                return o0.data.tolist()
+            except Exception:
+                pass
+
+    # 实在拿不到，就返回空
+    return []
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--segments-parquet", type=Path, required=True,
+                    help="Path to segments.parquet generated by build_features_preprocess.py")
+    ap.add_argument("--out-dir", type=Path, required=True,
+                    help="Output directory, sentence_embeddings.parquet will be written here")
+    ap.add_argument("--model-name", type=str, default="BAAI/bge-m3",
+                    help="Embedding model name/path supported by vLLM (e.g., BAAI/bge-m3, nomic-ai/nomic-embed-text-v1.5)")
+    ap.add_argument("--tensor-parallel-size", type=int, default=1,
+                    help="Number of GPUs for tensor parallelism in vLLM")
+    ap.add_argument("--dtype", type=str, default="auto",
+                    help="Model dtype for vLLM: auto/float16/bfloat16/float32 等，具体取决于 vLLM 版本")
+    ap.add_argument("--gpu-memory-utilization", type=float, default=0.9,
+                    help="vLLM gpu_memory_utilization，0~1，越大 KV cache 越大，但可能 OOM:contentReference[oaicite:3]{index=3}")
+    ap.add_argument("--trust-remote-code", action="store_true",
+                    help="Pass trust_remote_code=True to vLLM.LLM (for models with custom code)")
+    ap.add_argument("--enforce-eager", action="store_true",
+                    help="Use enforce_eager=True in LLM to禁用 CUDA graph，调试/小 batch 时更稳定:contentReference[oaicite:4]{index=4}")
+    ap.add_argument("--max-segments", type=int, default=-1,
+                    help="(可选 debug) 只对前 N 个 sentence 做 embedding，-1 表示全部。"
+                         "注意：如果用这个截断，Stage3 也需要用子集，否则行数对不上。")
+    args = ap.parse_args()
+
+    segments_path = args.segments_parquet
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    emb_path = out_dir / "sentence_embeddings.parquet"
+    meta_path = out_dir / "meta_embedding.json"
+
+    # ---- 初始化 vLLM 引擎 ----
+    # vLLM 会自动做连续 batching；encode/embed 都会根据 GPU 内存自动切 batch，
+    # 文档推荐“把所有 prompts 放进一个 list 里交给它”:contentReference[oaicite:5]{index=5}
+    print(f"[Stage2-vLLM] Loading vLLM LLM(model={args.model_name!r}, task='embed') ...")
+    t0 = time.time()
+    llm = LLM(
+        model=args.model_name,
+        task="embed",                   # 关键：声明这是 embedding 模型 :contentReference[oaicite:6]{index=6}
+        tensor_parallel_size=args.tensor_parallel_size,
+        dtype=args.dtype,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        trust_remote_code=args.trust_remote_code,
+        enforce_eager=args.enforce_eager,
+    )
+    print(f"[Stage2-vLLM] vLLM model loaded in {time.time()-t0:.1f}s")
+
+    # ---- 逐 row-group 流式读取 segments.parquet ----
+    pf = pq.ParquetFile(str(segments_path))
+    num_row_groups = pf.num_row_groups
+    print(f"[Stage2-vLLM] segments.parquet has {num_row_groups} row groups")
+
+    # 估计总 sentence 数量（用于进度条）
+    total_rows_meta = None
+    if pf.metadata is not None and pf.metadata.num_rows is not None:
+        total_rows_meta = int(pf.metadata.num_rows)
+
+    if args.max_segments > 0:
+        if total_rows_meta is not None:
+            total_for_pbar = min(total_rows_meta, args.max_segments)
+        else:
+            total_for_pbar = args.max_segments
+    else:
+        total_for_pbar = total_rows_meta  # 可能是 None
+    
+    writer = None
+    n_rows_total = 0
+    n_rows_encoded = 0
+    t1 = time.time()
+
+    # 主进度条：按 sentence 数量更新
+    pbar = tqdm(
+        total=total_for_pbar,
+        desc="[Stage2-vLLM] Embedding sentences",
+        unit="sent",
+    )
+    
+    for rg_idx in range(num_row_groups):
+        if args.max_segments > 0 and n_rows_encoded >= args.max_segments:
+            print(f"[Stage2-vLLM] Reached max_segments={args.max_segments}, stop early.")
+            break
+
+        print(f"[Stage2-vLLM] Reading row group {rg_idx+1}/{num_row_groups} ...")
+        # 只取我们需要的列，尽量节省内存
+        table = pf.read_row_group(
+            rg_idx,
+            columns=["sample_idx", "section_idx", "sent_idx", "text"]
+        )
+        df = table.to_pandas()
+        n_rows = len(df)
+        n_rows_total += n_rows
+        if n_rows == 0:
+            continue
+
+        # 根据 max_segments 可选截断当前 row-group
+        if args.max_segments > 0:
+            remain = args.max_segments - n_rows_encoded
+            if remain <= 0:
+                break
+            if n_rows > remain:
+                df = df.iloc[:remain].copy()
+                n_rows = len(df)
+
+        texts = df["text"].astype(str).tolist()
+
+        # ---- 一次性把当前 row-group 的所有句子塞进 vLLM.embed ----
+        print(f"[Stage2-vLLM] Calling llm.embed on {n_rows} sentences ...")
+        t_rg = time.time()
+        outputs = llm.embed(texts)  # 返回 list[EmbeddingRequestOutput]，顺序和输入一致:contentReference[oaicite:7]{index=7}
+        if len(outputs) != n_rows:
+            raise RuntimeError(
+                f"Row group {rg_idx}: llm.embed returned {len(outputs)} items, "
+                f"but input has {n_rows} sentences."
+            )
+
+        embs: List[List[float]] = []
+        for out in outputs:
+            emb_vec = extract_embedding_from_output(out)
+            embs.append(emb_vec)
+            n_rows_encoded += 1
+
+        print(f"  [Stage2-vLLM] row_group={rg_idx+1}, rows={n_rows}, "
+              f"encoded_so_far={n_rows_encoded}, time={time.time()-t_rg:.1f}s")
+
+        # ---- 写出这一组的 embedding ----
+        df_out = pd.DataFrame(
+            {
+                "sample_idx": df["sample_idx"].astype(np.int64),
+                "section_idx": df["section_idx"].astype(np.int32),
+                "sent_idx": df["sent_idx"].astype(np.int32),
+                "emb": embs,
+            }
+        )
+
+        table_out = pa.Table.from_pandas(df_out, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(
+                str(emb_path),
+                table_out.schema,
+                compression="zstd",
+                version="2.6",
+            )
+        writer.write_table(table_out)
+        # 更新 sentence 级进度条（按照当前 row-group 实际编码的行数更新）
+        pbar.update(len(df_out))
+        if args.max_segments > 0 and n_rows_encoded >= args.max_segments:
+            print(f"[Stage2-vLLM] Hit max_segments={args.max_segments}, stop after current row group.")
+            break
+    # 关闭进度条
+    pbar.close()
+    if writer is not None:
+        writer.close()
+
+    print(f"[Stage2-vLLM] Wrote embeddings: {emb_path}")
+    print(f"[Stage2-vLLM] Total sentences seen={n_rows_total}, encoded={n_rows_encoded}, "
+          f"time={time.time()-t1:.1f}s")
+
+    meta = {
+        "segments_path": str(segments_path),
+        "embeddings_path": str(emb_path),
+        "model_name": args.model_name,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "dtype": args.dtype,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "trust_remote_code": bool(args.trust_remote_code),
+        "enforce_eager": bool(args.enforce_eager),
+        "rows_total": int(n_rows_total),
+        "rows_encoded": int(n_rows_encoded),
+        "max_segments": int(args.max_segments),
+        "build_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[Stage2-vLLM] Wrote meta: {meta_path}")
+
+    print("[Stage2-vLLM Summary]")
+    print(f"  rows_total     = {n_rows_total:,}")
+    print(f"  rows_encoded   = {n_rows_encoded:,}")
+    print(f"  embeddings.parquet = {emb_path}")
+
+if __name__ == "__main__":
+    main()
+******************
+第三个代码：根据向量计算语义指标
+*****************
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+build_features_analysis.py  (Stage 3, 多进程版)
+
+从:
+  - preprocess_dir/features.parquet          (sample-level)
+  - preprocess_dir/segments.parquet          (sentence-level, 含 marker/lang)
+  - embed_dir/sentence_embeddings.parquet    (sentence-level, 向量)
+
+做 per-sample 的 embedding 分析:
+  - 语言分布: H_lang, num_lang_major, code_switch_count
+  - 冗余/聚类: R_dup, cluster_count, rho_max, plateau_len_max, loopiness
+  - marker 子集 (SELF_REFLECT/对比/结论) 和 wait-like 子集的相同指标
+  - RamblingScore (车轱辘话打分)
+
+并把结果 merge 回 features.parquet，输出:
+  - out_dir/features_analysis.parquet
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse, os, sys, time, math, json
+from typing import Dict, Any, Tuple, List
+
+import numpy as np
+import pandas as pd
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+import multiprocessing as mp
+
+# ------- 与 Stage1 对齐的 marker bitmask -------
+MARKER_SELF_REFLECT = 1
+MARKER_CONTRAST     = 2
+MARKER_CONCLUDE     = 4
+# worker 输出的列名统一在这里维护
+WORKER_METRIC_COLUMNS = [
+    "sample_idx",
+    "H_lang", "num_lang_major", "code_switch_count",
+    "all_r_dup", "all_cluster_count", "all_cluster_size_max", "all_rho_max", "all_loopiness", "all_plateau_len_max",
+    "marker_r_dup", "marker_cluster_count", "marker_cluster_size_max", "marker_rho_max", "marker_loopiness", "marker_plateau_len_max",
+    "wait_r_dup", "wait_cluster_count", "wait_cluster_size_max", "wait_rho_max", "wait_loopiness", "wait_plateau_len_max",
+    "embedding_truncated",
+]
+
+# ------- 全局变量 (在 fork 的子进程中共享，只读) -------
+GLOBAL_SEGMENTS_PATH: str | None = None
+GLOBAL_EMB_PATH: str | None = None
+GLOBAL_VALID_SAMPLE_SET: set[int] | None = None
+GLOBAL_PARAMS: Dict[str, Any] | None = None
+
+# 进程内缓存的 ParquetFile 对象（lazy init，一次打开，多次读）
+PF_SEG: pq.ParquetFile | None = None
+PF_EMB: pq.ParquetFile | None = None
+
+
+# ===================== 辅助函数 =====================
+
+def compute_lang_stats(sub: pd.DataFrame) -> Tuple[float, int, int]:
+    """
+    对某个 sample 的 sentence 子集 (sub) 计算:
+      - H_lang: 语言熵 (按字符数加权)
+      - num_lang_major: 占比 >0.1 的语言种类数
+      - code_switch_count: 相邻句子 lang_main 变化次数
+    依赖列:
+      - lang_main (str)
+      - sent_char_len (float)
+    """
+    if sub.empty:
+        return (float("nan"), 0, 0)
+
+    langs = sub["lang_main"].fillna("unk").astype(str).values
+    char_lens = sub["sent_char_len"].fillna(0.0).values.astype(float)
+    char_lens[char_lens <= 0] = 1.0
+
+    total_chars = float(char_lens.sum())
+    if total_chars <= 0:
+        return (float("nan"), 0, 0)
+
+    lang2chars: Dict[str, float] = {}
+    for lang, c in zip(langs, char_lens):
+        lang2chars[lang] = lang2chars.get(lang, 0.0) + float(c)
+    probs = np.array([v / total_chars for v in lang2chars.values()], dtype=float)
+    probs = probs[probs > 0]
+    if probs.size == 0:
+        H_lang = float("nan")
+    else:
+        H_lang = float(-(probs * np.log(probs)).sum())
+
+    num_lang_major = int((np.array(list(lang2chars.values())) / total_chars > 0.1).sum())
+
+    code_switch = 0
+    if len(langs) > 1:
+        for i in range(1, len(langs)):
+            if langs[i] != langs[i - 1]:
+                code_switch += 1
+
+    return (float(H_lang), int(num_lang_major), int(code_switch))
+
+
+def compute_subset_from_gram(
+    G: np.ndarray,
+    emb: np.ndarray,
+    sec_idx: np.ndarray,
+    sent_idx: np.ndarray,
+    mask: np.ndarray,
+    dup_threshold: float,
+    cluster_threshold: float,
+    plateau_min_len: int,
+    loop_eps: float,
+) -> Dict[str, float]:
+    """
+    在一个 sample 内，对 emb / Gram 矩阵的某个子集 mask 计算：
+      - r_dup: 近重复比例
+      - cluster_count, cluster_size_max, rho_max
+      - loopiness
+      - plateau_len_max
+    """
+    result = {
+        "r_dup": float("nan"),
+        "cluster_count": float("nan"),
+        "cluster_size_max": float("nan"),
+        "rho_max": float("nan"),
+        "loopiness": float("nan"),
+        "plateau_len_max": float("nan"),
+    }
+    idx = np.nonzero(mask)[0]
+    m = int(idx.size)
+    if m == 0:
+        return result
+
+    G_sub = G[np.ix_(idx, idx)]
+    emb_sub = emb[idx]
+    sec_sub = sec_idx[idx]
+    sent_sub = sent_idx[idx]
+
+    if m >= 2:
+        # ---- R_dup ----
+        G_tmp = G_sub.copy()
+        np.fill_diagonal(G_tmp, -1.0)
+        max_sim = G_tmp.max(axis=1)
+        r_dup = float((max_sim >= dup_threshold).mean())
+
+        # ---- cluster (基于相似度阈值的连通分量) ----
+        adj = (G_sub >= cluster_threshold)
+        np.fill_diagonal(adj, False)
+        visited = np.zeros(m, dtype=bool)
+        cluster_labels = -np.ones(m, dtype=int)
+        cluster_sizes: List[int] = []
+        c_id = 0
+        for i in range(m):
+            if not visited[i]:
+                stack = [i]
+                visited[i] = True
+                cluster_labels[i] = c_id
+                size = 1
+                while stack:
+                    u = stack.pop()
+                    neighbors = np.nonzero(adj[u] & ~visited)[0]
+                    if neighbors.size > 0:
+                        visited[neighbors] = True
+                        cluster_labels[neighbors] = c_id
+                        size += int(neighbors.size)
+                        stack.extend(neighbors.tolist())
+                cluster_sizes.append(size)
+                c_id += 1
+        if cluster_sizes:
+            cluster_count = len(cluster_sizes)
+            cluster_size_max = max(cluster_sizes)
+            rho_max = cluster_size_max / m
+        else:
+            cluster_count = m
+            cluster_size_max = 1
+            rho_max = 1.0 / m
+
+        # ---- loopiness (语义路径弧长 / 端点弧长) ----
+        order = np.lexsort((sent_sub, sec_sub))  # 先 section_idx, 再 sent_idx
+        seq = emb_sub[order]
+        # 邻接弧长
+        dot_next = (seq[:-1] * seq[1:]).sum(axis=1)
+        dot_next = np.clip(dot_next, -1.0, 1.0)
+        d = np.arccos(dot_next)
+        L = float(d.sum())
+        # 端点位移
+        dot_end = float(np.clip((seq[0] * seq[-1]).sum(), -1.0, 1.0))
+        D = float(np.arccos(dot_end))
+        loopiness = L / (D + loop_eps)
+
+        # ---- plateau (cluster 序列中最长连续节点数) ----
+        cl_seq = cluster_labels[order]
+        plateau_max = 1
+        cur_len = 1
+        for i in range(1, m):
+            if cl_seq[i] == cl_seq[i - 1]:
+                cur_len += 1
+                if cur_len > plateau_max:
+                    plateau_max = cur_len
+            else:
+                cur_len = 1
+
+        result.update({
+            "r_dup": float(r_dup),
+            "cluster_count": float(cluster_count),
+            "cluster_size_max": float(cluster_size_max),
+            "rho_max": float(rho_max),
+            "loopiness": float(loopiness),
+            "plateau_len_max": float(plateau_max),
+        })
+    else:
+        # m == 1
+        result.update({
+            "r_dup": 0.0,
+            "cluster_count": 1.0,
+            "cluster_size_max": 1.0,
+            "rho_max": 1.0,
+            "loopiness": 1.0,
+            "plateau_len_max": 1.0,
+        })
+    return result
+
+
+def compute_embedding_metrics_for_sample(
+    sub_emb: pd.DataFrame,
+    dup_threshold: float,
+    cluster_threshold: float,
+    plateau_min_len: int,
+    loop_eps: float,
+    max_sent_per_sample: int,
+) -> Dict[str, float]:
+    """
+    对一个 sample 的句子 + embedding 子集做 embedding 指标统计。
+    输入子 DataFrame 要包含列:
+      - emb: list[float] or np.ndarray
+      - section_idx, sent_idx, marker_mask, marker_wait_like
+    """
+    result = {
+        # all
+        "all_r_dup": float("nan"),
+        "all_cluster_count": float("nan"),
+        "all_cluster_size_max": float("nan"),
+        "all_rho_max": float("nan"),
+        "all_loopiness": float("nan"),
+        "all_plateau_len_max": float("nan"),
+
+        # marker
+        "marker_r_dup": float("nan"),
+        "marker_cluster_count": float("nan"),
+        "marker_cluster_size_max": float("nan"),
+        "marker_rho_max": float("nan"),
+        "marker_loopiness": float("nan"),
+        "marker_plateau_len_max": float("nan"),
+
+        # wait-like
+        "wait_r_dup": float("nan"),
+        "wait_cluster_count": float("nan"),
+        "wait_cluster_size_max": float("nan"),
+        "wait_rho_max": float("nan"),
+        "wait_loopiness": float("nan"),
+        "wait_plateau_len_max": float("nan"),
+
+        "embedding_truncated": 0.0,
+    }
+
+    if sub_emb.empty:
+        return result
+
+    # 转成 emb 矩阵（过滤掉 None）
+    emb_list = []
+    valid_idx = []
+    for i, e in enumerate(sub_emb["emb"].tolist()):
+        if isinstance(e, (list, tuple, np.ndarray)) and len(e) > 0:
+            arr = np.asarray(e, dtype=np.float32)
+            emb_list.append(arr)
+            valid_idx.append(i)
+    if not emb_list:
+        return result
+
+    emb = np.stack(emb_list, axis=0)  # [N_valid, d]
+    N_valid = emb.shape[0]
+    sec_idx = sub_emb["section_idx"].to_numpy()[valid_idx].astype(np.int32)
+    sent_idx = sub_emb["sent_idx"].to_numpy()[valid_idx].astype(np.int32)
+    marker_mask = sub_emb["marker_mask"].to_numpy()[valid_idx].astype(np.int32)
+    wait_like = sub_emb["marker_wait_like"].to_numpy()[valid_idx].astype(np.int32)
+
+    # 超过上限则子采样，保证 O(N^2) 可控
+    if max_sent_per_sample > 0 and N_valid > max_sent_per_sample:
+        idx_sub = np.linspace(0, N_valid - 1, num=max_sent_per_sample, dtype=int)
+        emb = emb[idx_sub]
+        sec_idx = sec_idx[idx_sub]
+        sent_idx = sent_idx[idx_sub]
+        marker_mask = marker_mask[idx_sub]
+        wait_like = wait_like[idx_sub]
+        N_valid = emb.shape[0]
+        result["embedding_truncated"] = 1.0
+
+    # Gram 矩阵（cos，相当于内积）
+    G = emb @ emb.T
+
+    # ---- 全部句子 ----
+    mask_all = np.ones(N_valid, dtype=bool)
+    stats_all = compute_subset_from_gram(
+        G, emb, sec_idx, sent_idx,
+        mask_all,
+        dup_threshold, cluster_threshold, plateau_min_len, loop_eps
+    )
+    result["all_r_dup"] = stats_all["r_dup"]
+    result["all_cluster_count"] = stats_all["cluster_count"]
+    result["all_cluster_size_max"] = stats_all["cluster_size_max"]
+    result["all_rho_max"] = stats_all["rho_max"]
+    result["all_loopiness"] = stats_all["loopiness"]
+    result["all_plateau_len_max"] = stats_all["plateau_len_max"]
+
+    # ---- marker 句子 ----
+    mask_marker = marker_mask != 0
+    if mask_marker.any():
+        stats_marker = compute_subset_from_gram(
+            G, emb, sec_idx, sent_idx,
+            mask_marker,
+            dup_threshold, cluster_threshold, plateau_min_len, loop_eps
+        )
+        result["marker_r_dup"] = stats_marker["r_dup"]
+        result["marker_cluster_count"] = stats_marker["cluster_count"]
+        result["marker_cluster_size_max"] = stats_marker["cluster_size_max"]
+        result["marker_rho_max"] = stats_marker["rho_max"]
+        result["marker_loopiness"] = stats_marker["loopiness"]
+        result["marker_plateau_len_max"] = stats_marker["plateau_len_max"]
+
+    # ---- wait-like 句子 ----
+    mask_wait = wait_like.astype(bool)
+    if mask_wait.any():
+        stats_wait = compute_subset_from_gram(
+            G, emb, sec_idx, sent_idx,
+            mask_wait,
+            dup_threshold, cluster_threshold, plateau_min_len, loop_eps
+        )
+        result["wait_r_dup"] = stats_wait["r_dup"]
+        result["wait_cluster_count"] = stats_wait["cluster_count"]
+        result["wait_cluster_size_max"] = stats_wait["cluster_size_max"]
+        result["wait_rho_max"] = stats_wait["rho_max"]
+        result["wait_loopiness"] = stats_wait["loopiness"]
+        result["wait_plateau_len_max"] = stats_wait["plateau_len_max"]
+
+    return result
+
+
+def compute_rambling_score(
+    r_self_sent: float,
+    marker_r_dup: float,
+    marker_loopiness: float,
+    marker_plateau_len_max: float,
+    H_lang: float,
+    weights: Dict[str, float],
+    loopiness_cap: float,
+    plateau_k: int,
+) -> float:
+    """
+    RamblingScore = 线性可调组合:
+      - 自我打断比例 r_self_sent
+      - marker 区域重复度 marker_r_dup
+      - marker 区域 loopiness (裁剪)
+      - marker plateau >= k 的指示
+      - 语言熵 H_lang
+    """
+    if math.isnan(r_self_sent) or math.isnan(marker_r_dup):
+        return float("nan")
+
+    loop_component = 0.0
+    if loopiness_cap > 0 and not math.isnan(marker_loopiness):
+        loop_component = min(marker_loopiness, loopiness_cap) / loopiness_cap
+
+    plateau_component = 1.0 if (not math.isnan(marker_plateau_len_max) and marker_plateau_len_max >= plateau_k) else 0.0
+    H_term = H_lang if not math.isnan(H_lang) else 0.0
+
+    score = (
+        weights["self"] * r_self_sent +
+        weights["dup"] * marker_r_dup +
+        weights["loop"] * loop_component +
+        weights["plateau"] * plateau_component +
+        weights["lang"] * H_term
+    )
+    return float(score)
+
+
+# ===================== 多进程 worker =====================
+
+def _init_worker(segments_path: str,
+                 emb_path: str,
+                 valid_sample_list: List[int],
+                 params: Dict[str, Any]):
+    """
+    spawn 模式下每个子进程启动时调用一次，把必要的全局变量写进去
+    """
+    global GLOBAL_SEGMENTS_PATH, GLOBAL_EMB_PATH, GLOBAL_VALID_SAMPLE_SET, GLOBAL_PARAMS
+    GLOBAL_SEGMENTS_PATH = segments_path
+    GLOBAL_EMB_PATH = emb_path
+    # 用 set 加速 sample_idx 过滤
+    GLOBAL_VALID_SAMPLE_SET = set(valid_sample_list)
+    GLOBAL_PARAMS = params
+
+def _worker_rowgroup(rg_idx: int) -> pd.DataFrame:
+    """
+    每个 worker 处理一个 row group:
+      - 读 segments & embeddings 的该 row group
+      - 过滤 sample_idx ∈ GLOBAL_VALID_SAMPLE_SET
+      - 对每个 sample_idx 计算语言 + embedding 指标
+    返回的 DataFrame:
+      - sample_idx
+      - H_lang, num_lang_major, code_switch_count
+      - all_* / marker_* / wait_* / embedding_truncated
+    """
+    global PF_SEG, PF_EMB
+    if GLOBAL_SEGMENTS_PATH is None or GLOBAL_EMB_PATH is None or GLOBAL_VALID_SAMPLE_SET is None or GLOBAL_PARAMS is None:
+        raise RuntimeError("Global paths/params not initialized in worker")
+
+    # Lazy 初始化 ParquetFile（每个进程只打开一次）
+    if PF_SEG is None or PF_EMB is None:
+        PF_SEG = pq.ParquetFile(GLOBAL_SEGMENTS_PATH)
+        PF_EMB = pq.ParquetFile(GLOBAL_EMB_PATH)
+
+    table_seg = PF_SEG.read_row_group(rg_idx)
+    table_emb = PF_EMB.read_row_group(rg_idx)
+    df_seg = table_seg.to_pandas()
+    df_emb = table_emb.to_pandas()
+    if len(df_seg) != len(df_emb):
+        raise ValueError(f"Row group {rg_idx} segments vs embeddings row mismatch: {len(df_seg)} vs {len(df_emb)}")
+
+    df = df_seg.copy()
+    df["emb"] = df_emb["emb"]
+
+    # 只保留我们要分析的 sample（kept/correct 过滤在主进程决定）
+    df = df[df["sample_idx"].isin(GLOBAL_VALID_SAMPLE_SET)]
+    # >>> 新增：打印一下这个 row group 的大小情况
+    print(
+        f"[Worker {os.getpid()}] rg={rg_idx}: rows_seg={len(df_seg)}, "
+        f"rows_valid={len(df)}, samples_valid={df['sample_idx'].nunique()}",
+        flush=True,
+    )
+    # <<<
+    if df.empty:
+        return pd.DataFrame(columns=WORKER_METRIC_COLUMNS)
+
+    rows: List[Dict[str, Any]] = []
+
+    for sid, sub in df.groupby("sample_idx"):
+        # 1) 语言统计
+        H_lang, num_lang_major, code_switch_count = compute_lang_stats(sub)
+
+        # 2) embedding 指标
+        metrics_emb = compute_embedding_metrics_for_sample(
+            sub,
+            dup_threshold=GLOBAL_PARAMS["dup_threshold"],
+            cluster_threshold=GLOBAL_PARAMS["cluster_threshold"],
+            plateau_min_len=GLOBAL_PARAMS["plateau_min_len"],
+            loop_eps=GLOBAL_PARAMS["loop_eps"],
+            max_sent_per_sample=GLOBAL_PARAMS["max_sent_per_sample"],
+        )
+
+        row = {
+            "sample_idx": int(sid),
+            "H_lang": H_lang,
+            "num_lang_major": int(num_lang_major),
+            "code_switch_count": int(code_switch_count),
+        }
+        row.update(metrics_emb)
+        rows.append(row)
+
+    # rows 可能为空（理论上不太会发生），也没关系，DataFrame 会是空表但列名一致
+    return pd.DataFrame(rows, columns=WORKER_METRIC_COLUMNS)
+
+
+# ===================== 主函数 =====================
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--preprocess-dir", type=Path, required=True,
+                    help="Dir containing features.parquet & segments.parquet")
+    ap.add_argument("--embed-dir", type=Path, required=True,
+                    help="Dir containing sentence_embeddings.parquet")
+    ap.add_argument("--out-dir", type=Path, required=True)
+
+    ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 8) // 2),
+                    help="并行进程数")
+
+    ap.add_argument("--dup-threshold", type=float, default=0.90)
+    ap.add_argument("--cluster-threshold", type=float, default=0.85)
+    ap.add_argument("--plateau-min-len", type=int, default=3)
+    ap.add_argument("--loop-eps", type=float, default=1e-4)
+    ap.add_argument("--max-sent-per-sample", type=int, default=128,
+                    help="每个 sample 做 embedding 分析时最多使用多少句子 (>0 即子采样)")
+
+    ap.add_argument("--only-kept", action="store_true",
+                    help="只对 kept_flag==1 的 sample 做分析")
+    ap.add_argument("--only-correct", action="store_true",
+                    help="只对 cls_id==1 的 sample 做分析")
+
+    # RamblingScore 的权重 & 超参
+    ap.add_argument("--rambling-weight-self", type=float, default=1.0)
+    ap.add_argument("--rambling-weight-dup", type=float, default=1.0)
+    ap.add_argument("--rambling-weight-loop", type=float, default=1.0)
+    ap.add_argument("--rambling-weight-plateau", type=float, default=1.0)
+    ap.add_argument("--rambling-weight-lang", type=float, default=0.1)
+    ap.add_argument("--rambling-loopiness-cap", type=float, default=5.0)
+    ap.add_argument("--rambling-plateau-k", type=int, default=4)
+
+    args = ap.parse_args()
+
+    out_dir = args.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    samples_path = args.preprocess_dir / "features.parquet"
+    segments_path = args.preprocess_dir / "segments.parquet"
+    emb_path = args.embed_dir / "sentence_embeddings.parquet"
+    out_features_path = out_dir / "features_analysis.parquet"
+    meta_path = out_dir / "meta_analysis.json"
+
+    print(f"[Stage3] Loading sample-level features from {samples_path}")
+    t0 = time.time()
+    samples_df = pd.read_parquet(samples_path)
+    n_samples = len(samples_df)
+    print(f"[Stage3] Loaded {n_samples:,} samples in {time.time()-t0:.1f}s")
+
+    if "sample_idx" not in samples_df.columns:
+        raise ValueError("features.parquet must contain 'sample_idx' column")
+
+    # 选择需要做 embedding 分析的 sample
+    mask_valid = np.ones(n_samples, dtype=bool)
+    if args.only_kept and "kept_flag" in samples_df.columns:
+        mask_valid &= (samples_df["kept_flag"].to_numpy().astype(int) == 1)
+    if args.only_correct and "cls_id" in samples_df.columns:
+        mask_valid &= (samples_df["cls_id"].to_numpy().astype(int) == 1)
+    valid_sample_idxs = samples_df.loc[mask_valid, "sample_idx"].astype(int).unique().tolist()
+    print(f"[Stage3] Will analyze {len(valid_sample_idxs):,} samples (after kept/correct filter)")
+
+    # 先准备一个 metrics DataFrame 的骨架: 所有列为 NaN/0，后面覆盖 valid 部分
+    # 这些列名要与 worker 输出一致 + rambling_score
+    metric_cols = [
+        "H_lang", "num_lang_major", "code_switch_count",
+        "all_r_dup", "all_cluster_count", "all_cluster_size_max", "all_rho_max", "all_loopiness", "all_plateau_len_max",
+        "marker_r_dup", "marker_cluster_count", "marker_cluster_size_max", "marker_rho_max", "marker_loopiness", "marker_plateau_len_max",
+        "wait_r_dup", "wait_cluster_count", "wait_cluster_size_max", "wait_rho_max", "wait_loopiness", "wait_plateau_len_max",
+        "embedding_truncated",
+    ]
+
+    # metrics_all：最后按 sample_idx 对齐
+    metrics_all = pd.DataFrame({
+        "sample_idx": samples_df["sample_idx"].astype(int).values
+    })
+    for col in metric_cols:
+        if col in {"num_lang_major", "code_switch_count"}:
+            metrics_all[col] = np.zeros(n_samples, dtype=np.int32)
+        else:
+            metrics_all[col] = np.full(n_samples, np.nan, dtype=np.float32)
+
+    # # 全局参数 (给子进程)
+    # global GLOBAL_SEGMENTS_PATH, GLOBAL_EMB_PATH, GLOBAL_VALID_SAMPLE_SET, GLOBAL_PARAMS
+    # GLOBAL_SEGMENTS_PATH = str(segments_path)
+    # GLOBAL_EMB_PATH = str(emb_path)
+    # GLOBAL_VALID_SAMPLE_SET = set(valid_sample_idxs)
+    # GLOBAL_PARAMS = {
+    #     "dup_threshold": args.dup_threshold,
+    #     "cluster_threshold": args.cluster_threshold,
+    #     "plateau_min_len": args.plateau_min_len,
+    #     "loop_eps": args.loop_eps,
+    #     "max_sent_per_sample": args.max_sent_per_sample,
+    # }
+    # 准备传给 worker 的参数（spawn 模式下通过 initializer 传递）
+    worker_params = {
+        "dup_threshold": args.dup_threshold,
+        "cluster_threshold": args.cluster_threshold,
+        "plateau_min_len": args.plateau_min_len,
+        "loop_eps": args.loop_eps,
+        "max_sent_per_sample": args.max_sent_per_sample,
+    }
+
+    # 主进程先读一遍 Parquet metadata，拿 num_row_groups
+    pf_seg_main = pq.ParquetFile(str(segments_path))
+    pf_emb_main = pq.ParquetFile(str(emb_path))
+    if pf_seg_main.num_row_groups != pf_emb_main.num_row_groups:
+        raise ValueError("segments.parquet and sentence_embeddings.parquet have different #row_groups")
+    num_row_groups = pf_seg_main.num_row_groups
+    print(f"[Stage3] segments / embeddings row groups = {num_row_groups}")
+
+    # # 多进程跑 rowgroup
+    # print(f"[Stage3] Running analysis with {args.procs} processes ...")
+    # t1 = time.time()
+    # start_method = "spawn" if sys.platform == "win32" else "fork"
+    # ctx = mp.get_context(start_method)
+
+    # rg_indices = list(range(num_row_groups))
+    # partial_metrics_list: List[pd.DataFrame] = []
+
+    # with ctx.Pool(processes=args.procs) as pool:
+    #     for i, df_rg in enumerate(pool.imap_unordered(_worker_rowgroup, rg_indices, chunksize=1)):
+    # 多进程跑 rowgroup
+    # 1) 固定用 spawn，避免 pyarrow + fork 的潜在坑
+    # 2) 进程数不超过 row_groups 数量
+    max_procs = min(args.procs, num_row_groups)
+    print(f"[Stage3] Running analysis with {max_procs} processes (row_groups={num_row_groups}) ...")
+    t1 = time.time()
+    ctx = mp.get_context("spawn")
+
+    rg_indices = list(range(num_row_groups))
+    partial_metrics_list: List[pd.DataFrame] = []
+
+    # 通过 initializer 把路径 & 参数传给每个子进程
+    with ctx.Pool(
+        processes=max_procs,
+        initializer=_init_worker,
+        initargs=(str(segments_path), str(emb_path), valid_sample_idxs, worker_params),
+    ) as pool:
+        for i, df_rg in enumerate(pool.imap_unordered(_worker_rowgroup, rg_indices, chunksize=1)):
+            if not df_rg.empty:
+                partial_metrics_list.append(df_rg)
+            if (i + 1) % 5 == 0 or (i + 1) == num_row_groups:
+                print(f"  [Stage3] row groups processed: {i+1}/{num_row_groups}")
+
+    if partial_metrics_list:
+        metrics_concat = pd.concat(partial_metrics_list, ignore_index=True)
+        # 对 sample_idx 去重（理论上不会重复）
+        metrics_concat = metrics_concat.drop_duplicates(subset=["sample_idx"], keep="last")
+        metrics_concat.set_index("sample_idx", inplace=True)
+
+        # 按 sample_idx 对齐覆盖
+        idx_series = samples_df["sample_idx"].astype(int)
+        for col in metric_cols:
+            if col not in metrics_concat.columns:
+                continue
+            aligned = metrics_concat[col].reindex(idx_series).to_numpy()
+            metrics_all[col] = aligned
+    else:
+        print("[Stage3] No metrics computed (no valid samples?).")
+
+    print(f"[Stage3] Embedding-based metrics computed in {time.time()-t1:.1f}s")
+
+    # 把 metrics_all merge 回 samples_df
+    for col in metric_cols:
+        samples_df[col] = metrics_all[col].values
+
+    # 计算 RamblingScore（在主进程做）
+    weights = {
+        "self": args.rambling_weight_self,
+        "dup": args.rambling_weight_dup,
+        "loop": args.rambling_weight_loop,
+        "plateau": args.rambling_weight_plateau,
+        "lang": args.rambling_weight_lang,
+    }
+    loop_cap = args.rambling_loopiness_cap
+    plateau_k = args.rambling_plateau_k
+
+    print("[Stage3] Computing rambling_score ...")
+    # 准备数组
+    rambling_scores = np.full(n_samples, np.nan, dtype=np.float32)
+
+    num_sent_arr = samples_df.get("num_sentences", pd.Series(np.nan, index=samples_df.index)).to_numpy().astype(float)
+    num_self_arr = samples_df.get("num_self_reflect_sentences", pd.Series(np.nan, index=samples_df.index)).to_numpy().astype(float)
+    H_lang_arr = samples_df["H_lang"].to_numpy().astype(float)
+    marker_r_dup_arr = samples_df["marker_r_dup"].to_numpy().astype(float)
+    marker_loopiness_arr = samples_df["marker_loopiness"].to_numpy().astype(float)
+    marker_plateau_arr = samples_df["marker_plateau_len_max"].to_numpy().astype(float)
+
+    for i in range(n_samples):
+        if not mask_valid[i]:
+            continue
+        num_sent = num_sent_arr[i]
+        num_self = num_self_arr[i]
+        if num_sent > 0 and not math.isnan(num_self):
+            r_self = num_self / num_sent
+        else:
+            r_self = float("nan")
+
+        rs = compute_rambling_score(
+            r_self,
+            marker_r_dup_arr[i],
+            marker_loopiness_arr[i],
+            marker_plateau_arr[i],
+            H_lang_arr[i],
+            weights=weights,
+            loopiness_cap=loop_cap,
+            plateau_k=plateau_k,
+        )
+        rambling_scores[i] = rs
+
+    samples_df["rambling_score"] = rambling_scores
+
+    print(f"[Stage3] Writing features_analysis.parquet to {out_features_path}")
+    t2 = time.time()
+    samples_df.to_parquet(out_features_path, index=False)
+    print(f"[Stage3] Wrote features_analysis in {time.time()-t2:.1f}s")
+
+    meta = {
+        "preprocess_dir": str(args.preprocess_dir),
+        "embed_dir": str(args.embed_dir),
+        "out_features_path": str(out_features_path),
+        "dup_threshold": args.dup_threshold,
+        "cluster_threshold": args.cluster_threshold,
+        "plateau_min_len": args.plateau_min_len,
+        "loop_eps": args.loop_eps,
+        "max_sent_per_sample": args.max_sent_per_sample,
+        "only_kept": args.only_kept,
+        "only_correct": args.only_correct,
+        "rambling_weights": weights,
+        "rambling_loopiness_cap": args.rambling_loopiness_cap,
+        "rambling_plateau_k": args.rambling_plateau_k,
+        "procs": args.procs,
+        "build_time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[Stage3] Wrote meta: {meta_path}")
+
+    print("[Stage3 Summary]")
+    print(f"  samples total      = {n_samples:,}")
+    print(f"  samples analyzed   = {mask_valid.sum():,}")
+    print(f"  output path        = {out_features_path}")
+
+if __name__ == "__main__":
+    main()
+*****************
+4. 过滤
+计算好指标后，根据指标结果进行过滤。现在我们已经设计好了filter的判断规则，但是下面的这份参考代码没有指标计算信息，其实就是希望你把前面的指标记算和下面的过滤结合起来。这是一个写好的filter的代码。
+**************
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+select_and_plot_from_features.py
+
+基于 build_features_preprocess.py / build_features_analysis.py 生成的 Parquet：
+
+1）按各种条件筛选 sample：
+    --cls {any,correct,wrong,no_judge}
+    --kept-or-dropped {all,kept,dropped}
+    --chinese-or-english {all,chinese,english}
+    --step-min / --step-max
+    --where 'pandas 表达式'
+    --ge/--le/--eq 'col:val'
+    --dedup-uid
+    --limit / --per-step-limit
+
+2）把筛选结果导出成 JSONL（从原始大 JSONL 按 byte_offset 精确拷贝）。
+
+3）可视化（可关掉：--no-plot）：
+    - 横轴 global_step
+    - 纵轴各种 metrics
+    - scatter + jitter + 颜色区分 correct / wrong / no_judge
+    - 每 step 一个聚合值（mean/median/sum）画黑色折线
+    - 按类别分三个子目录：
+        <plot_dir>/training/*.png
+        <plot_dir>/text/*.png
+        <plot_dir>/lang_emb/*.png
+
+如果筛选条件导致 0 行：
+    - JSONL 保持空（符合筛选逻辑）
+    - Plot 自动用全体样本做可视化（打印 WARNING）
+"""
+
+from __future__ import annotations
+from pathlib import Path
+import argparse, json, os, sys, time, math, hashlib
+from typing import Any, Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import re
+import multiprocessing as mp
+from collections import Counter
+
+# ------------------ 模式匹配过滤 ------------------ #
+# 文本模式匹配使用的默认进程数（会在 main() 里根据参数重新设置）
+PATTERN_WORKERS: int = 1
+
+# ===== 连续重复片段规则的一些可调阈值 =====
+# 最小需要多少个 token 才进行“重复片段”检测（太短的回答直接跳过，省时间也减少误报）
+MIN_TOKENS_FOR_REPEAT_CHECK = 30
+
+# 片段长度用 token 的 n-gram 来扫：从 1 到 MAX
+REPEAT_NGRAM_MIN = 1
+REPEAT_NGRAM_MAX = 16   # 你可以改成 8 / 12 之类的
+
+# 判定“严重重复”的阈值：
+# - 同一个片段（n-gram）连续重复至少 MIN_REPEAT_BLOCKS 次
+# - 且这些重复一共覆盖的 token 数 >= MIN_REPEAT_TOTAL_TOKENS
+MIN_REPEAT_BLOCKS = 16           # 8 段连在一起，已经非常怪了
+MIN_REPEAT_TOTAL_TOKENS = max(20, MIN_REPEAT_BLOCKS)    # 总长度 ≥ 60 个 token，太短了会把一些数学的数字list误删
+
+# ------------- 重复啰嗦 -----------------------------
+def _tokens_from_text(resp: str) -> List[str]:
+    """
+    一个非常简单的分词：按空白切分。
+    对我们关心的重复片段（no,no,no... / Answer: 39916800 / 8 = 4989600 ...）足够用。
+    """
+    return re.findall(r"\S+", resp)
+def _tokens_to_ids(tokens: List[str]) -> List[int]:
+    """
+    把 token 映射到稳定的整数 ID，方便做 rolling hash。
+    每条样本单独一个小词表，开销很低。
+    """
+    mapping: Dict[str, int] = {}
+    ids: List[int] = []
+    next_id = 1
+    for t in tokens:
+        if t not in mapping:
+            mapping[t] = next_id
+            next_id += 1
+        ids.append(mapping[t])
+    return ids
+def _max_tandem_repeat_blocks(
+    seq: List[int],
+    min_block_len: int = REPEAT_NGRAM_MIN,
+    max_block_len: int = REPEAT_NGRAM_MAX,
+) -> Tuple[int, int]:
+    """
+    在整数序列 seq 上寻找“同一片段连续重复”的最大次数。
+
+    返回: (max_blocks, max_total_len)
+        max_blocks     : 最多重复了多少“段”（>=1）
+        max_total_len  : 对应重复片段覆盖的 token 总数 = max_blocks * block_len
+
+    我们只关心连续的 A A A A A... 或 AB AB AB AB... 这种“串联重复”，
+    而不是全局的出现次数。
+    """
+    n = len(seq)
+    if n < 2 * min_block_len:
+        return 1, 0
+
+    max_block_len = min(max_block_len, n // 2)
+    if max_block_len < min_block_len:
+        return 1, 0
+
+    # 64-bit rolling hash
+    MOD_MASK = (1 << 64) - 1
+    BASE = 911382323
+
+    prefix = [0] * (n + 1)
+    pow_base = [1] * (n + 1)
+    for i, x in enumerate(seq):
+        prefix[i + 1] = (prefix[i] * BASE + (x + 1)) & MOD_MASK
+        pow_base[i + 1] = (pow_base[i] * BASE) & MOD_MASK
+
+    def _hash(l: int, r: int) -> int:
+        """哈希 seq[l:r]"""
+        return (prefix[r] - (prefix[l] * pow_base[r - l] & MOD_MASK)) & MOD_MASK
+
+    best_blocks = 1
+    best_total_len = 0
+
+    # 按块长 k（n-gram 长度）枚举
+    for k in range(min_block_len, max_block_len + 1):
+        i = 0
+        # 至少要有两段才能称为“重复”
+        while i + 2 * k <= n:
+            h1 = _hash(i, i + k)
+            h2 = _hash(i + k, i + 2 * k)
+            if h1 != h2:
+                i += 1
+                continue
+
+            # 找到了至少 2 段完全相同的片段，从这里往后延伸
+            blocks = 2
+            j = i + 2 * k
+            while j + k <= n and _hash(j, j + k) == h1:
+                blocks += 1
+                j += k
+
+            total_len = blocks * k
+            if blocks > best_blocks or (blocks == best_blocks and total_len > best_total_len):
+                best_blocks = blocks
+                best_total_len = total_len
+
+            # 跳过这一整串重复片段，避免 O(n^2) 行为
+            i = j
+
+    return best_blocks, best_total_len
+def _rule_tandem_repetition(resp: str) -> bool:
+    """
+    规则 1：检测“连续重复的语言片段”（单词 / 短语 / 句子片段）。
+
+    思路：
+      1）把 response 按空白切成 token 序列。
+      2）用 rolling hash 在 token 序列上找：
+           - 某个 n-gram（1~REPEAT_NGRAM_MAX）连续重复了很多次
+           - 且覆盖足够长的 token 数。
+      3）如果满足 (重复段数 >= MIN_REPEAT_BLOCKS 且 总长度 >= MIN_REPEAT_TOTAL_TOKENS)
+         则认为这是“严重重复啰嗦”，返回 True。
+    """
+    if not isinstance(resp, str):
+        return False
+
+    s = resp.strip()
+    if not s:
+        return False
+
+    tokens = _tokens_from_text(s)
+    if len(tokens) < MIN_TOKENS_FOR_REPEAT_CHECK:
+        # 太短的不做重复片段检测，既省算力也很少会是我们想过滤的垃圾
+        return False
+
+    ids = _tokens_to_ids(tokens)
+    max_blocks, max_total_len = _max_tandem_repeat_blocks(ids)
+
+    # 你可以调下面两个阈值：
+    # - max_blocks：同一个片段连续重复了多少“段”
+    # - max_total_len：这些重复一共覆盖了多少 token
+    if max_blocks >= MIN_REPEAT_BLOCKS and max_total_len >= MIN_REPEAT_TOTAL_TOKENS:
+        return True
+
+    return False
+
+def _is_redundant_noisy_response(resp: str) -> bool:
+    """
+    顶层的“啰嗦/垃圾响应”判定入口。
+
+    以后可以把各种规则写成 _rule_xxx，然后加到 RULE_FNS 里即可。
+    通过“注释/取消注释”来选择开启哪几条规则。
+    """
+    if not isinstance(resp, str) or resp == "":
+        return False
+
+    # 需要启用的规则列表：
+    RULE_FNS = [
+        _rule_tandem_repetition,  # 规则 1：连续重复片段（单词/短语/句子片段）
+        # 以后你可以在这里继续加：
+        # _rule_answer_tail_garbage,
+        # _rule_brace_noise,
+        # _rule_wait_spam,
+    ]
+
+    for fn in RULE_FNS:
+        if fn(resp):
+            return True
+    return False
+def _check_redundant_chunk(responses: List[str]) -> List[bool]:
+    """
+    多进程用：对一块 response 列表跑 _is_redundant_noisy_response。
+    """
+    out: List[bool] = []
+    for resp in responses:
+        out.append(_is_redundant_noisy_response(resp))
+    return out
+def pattern_redundant_answer_noise(df: pd.DataFrame) -> pd.Series:
+    """
+    模式 X：文本层面的“重复啰嗦 / 垃圾尾巴”检测。
+
+    完全基于 response_text：
+      - 不依赖任何 text_metrics
+      - 不区分 prompt 类型
+    """
+    print("[INFO] Filter pattern_redundant_answer_noise...")
+    if "response_text" not in df.columns:
+        raise KeyError("pattern_redundant_answer_noise 需要 df 中存在 'response_text' 列")
+
+    responses = df["response_text"].astype(str).tolist()
+    n = len(responses)
+    if n == 0:
+        return pd.Series(False, index=df.index)
+
+    workers = max(1, int(PATTERN_WORKERS or 1))
+
+    # 小数据或只用一个进程：直接单线程
+    if workers == 1 or n < 1000:
+        flags = [_is_redundant_noisy_response(resp) for resp in responses]
+    else:
+        # 大数据：按块切，降低进程间通信开销，充分利用多核
+        chunk_size = max(1, n // (workers * 4))
+        chunks: List[List[str]] = []
+        for i in range(0, n, chunk_size):
+            chunks.append(responses[i : i + chunk_size])
+
+        flags: List[bool] = []
+        with mp.Pool(processes=workers) as pool:
+            for part in pool.map(_check_redundant_chunk, chunks):
+                flags.extend(part)
+
+    return pd.Series(flags, index=df.index)
+
+# ------------ 其他过滤项 ------------------------
+def pattern_ce_ref_mean_too_large(df: pd.DataFrame) -> pd.Series:
+    """
+    模式 1：
+    CE ref mean (列名: ce_ref_seq_mean) > 1.8 的样本视为“命中模式”，需要被过滤掉。
+    """
+    print("[INFO] Filter pattern_ce_ref_mean_too_large...")
+    if "ce_ref_seq_mean" not in df.columns:
+        # 没有这个列就当没命中
+        return pd.Series(False, index=df.index)
+    return df["ce_ref_seq_mean"].astype(float) > 1.8
+
+def pattern_repeat_word_run_max_too_large(df: pd.DataFrame) -> pd.Series:
+    """
+    模式 2：
+    repeat_word_run_max > 25 的样本视为“命中模式”，需要被过滤掉。
+    """
+    print("[INFO] Filter pattern_repeat_word_run_max_too_large...")
+    if "repeat_word_run_max" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["repeat_word_run_max"].astype(float) > 25
+
+def pattern_num_self_reflect_sentences_too_more(df: pd.DataFrame) -> pd.Series:
+    print("[INFO] Filter pattern_num_self_reflect_sentences_too_more...")
+    if "num_self_reflect_sentences" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["num_self_reflect_sentences"].astype(float) > 40
+
+def pattern_marker_loopiness_too_more(df: pd.DataFrame) -> pd.Series:
+    print("[INFO] Filter pattern_marker_loopiness_too_more...")
+    if "marker_loopiness" not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df["marker_loopiness"].astype(float) > 50
+
+# -----------过滤器核心 ------------------------
+def build_filter_mask_by_patterns(
+    df: pd.DataFrame,
+    target_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    基于一组“模式函数”做过滤：
+        - 每个模式函数返回一个 bool Series，True 表示“命中该模式”。
+        - 多个模式之间是 OR 关系。
+        - 只有 target_mask 为 True 的样本才会被真正过滤；
+          target_mask 为 False 的样本永远不会被标记为命中。
+
+    返回:
+        keep_mask: np.ndarray[bool]，True = 保留
+        bad_mask : np.ndarray[bool]，True = 被模式命中（会被过滤）
+    """
+    n = len(df)
+    if n == 0:
+        return np.ones(0, dtype=bool), np.zeros(0, dtype=bool)
+
+    if target_mask is None:
+        target_mask_series = pd.Series(True, index=df.index)
+    else:
+        if len(target_mask) != n:
+            raise ValueError("target_mask 长度与 df 不一致")
+        target_mask_series = pd.Series(target_mask, index=df.index)
+
+    print("[INFO] Start filtering:")
+    # 在这里注册所有模式
+    pattern_fns = [
+        pattern_ce_ref_mean_too_large,
+        pattern_repeat_word_run_max_too_large,
+        pattern_num_self_reflect_sentences_too_more,
+        pattern_marker_loopiness_too_more,
+        pattern_redundant_answer_noise,  # NEW: 文本级重复/垃圾检测
+        # 以后新增模式继续往下加
+    ]
+
+    bad_mask = pd.Series(False, index=df.index)
+
+    for fn in pattern_fns:
+        m = fn(df)
+        if m is None:
+            continue
+        if len(m) != n:
+            raise ValueError(f"Pattern {fn.__name__} 返回的 mask 长度不匹配")
+        # 只在 target_mask 为 True 的位置上应用模式
+        bad_mask |= (m & target_mask_series)
+
+    keep_mask = ~bad_mask
+    return keep_mask.to_numpy(), bad_mask.to_numpy()
+
+# ------------------ 小工具函数 ------------------ #
+
+def parse_cmp_list(items: List[str]) -> List[Tuple[str, float]]:
+    out = []
+    for it in items or []:
+        if ":" not in it:
+            raise ValueError(f"Bad 'col:val' item: {it}")
+        col, val = it.split(":", 1)
+        out.append((col.strip(), float(val)))
+    return out
+
+def salt64_from_uid(uid: Any) -> int:
+    s = str(uid)
+    h = hashlib.blake2b(s.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(h, "little", signed=False)
+
+def jitter_from_salt(salts: np.ndarray, scale: float) -> np.ndarray:
+    # 把 salt 映射到 [0,1) 再线性映射到 [-scale, scale]
+    r = (salts % 10_000_019) / 10_000_019.0
+    return (r - 0.5) * 2.0 * scale
+
+
+# ------------------ 聚合 & 画图 ------------------ #
+
+COLOR_CORRECT = "blue"
+COLOR_WRONG   = "red"
+COLOR_UNKNOWN = "purple"
+COLOR_AGG     = "black"
+
+def aggregate_per_step(values: np.ndarray,
+                       steps: np.ndarray,
+                       agg: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    对 (steps, values) 做 per-step 聚合。
+    values 中 NaN 会被忽略；若某 step 全是 NaN，则跳过。
+    """
+    df = pd.DataFrame({"step": steps, "val": values})
+    df = df[np.isfinite(df["val"].values)]
+    if df.empty:
+        return np.array([], dtype=np.int64), np.array([], dtype=float)
+
+    if agg == "median":
+        gb = df.groupby("step")["val"].median()
+    elif agg == "sum":
+        gb = df.groupby("step")["val"].sum()
+    else:
+        gb = df.groupby("step")["val"].mean()
+
+    xs = gb.index.to_numpy()
+    ys = gb.values
+    return xs, ys
+
+
+def scatter_one_metric(
+    out_png: Path,
+    metric_name: str,
+    values: np.ndarray,     # shape [N]
+    steps: np.ndarray,      # shape [N]
+    cls_id: np.ndarray,     # 1=correct, 0=wrong, 2=no_judge
+    jitter_seeds: np.ndarray,
+    agg: str,
+    jitter: float,
+    point_size: int,
+    alpha: float,
+    y_label: str,
+    title: str,
+):
+    """
+    沙箱图：scatter + per-step 聚合折线
+    """
+    t0 = time.time()
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    ok = np.isfinite(values)
+    if not np.any(ok):
+        print(f"[WARN] metric={metric_name} 全是 NaN，跳过绘图")
+        plt.close(fig)
+        return
+
+    steps_ok = steps[ok].astype(float)
+    vals_ok = values[ok]
+    cls_ok = cls_id[ok]
+    jitter_seed_ok = jitter_seeds[ok]
+
+    js = jitter_from_salt(jitter_seed_ok, jitter)
+
+    mask_wrong   = (cls_ok == 0)
+    mask_correct = (cls_ok == 1)
+    mask_unknown = (cls_ok == 2)
+
+    def _scatter(mask, marker, color, label):
+        if not np.any(mask):
+            return
+        xs = steps_ok[mask] + js[mask]
+        ys = vals_ok[mask]
+        ax.scatter(xs, ys, s=point_size, alpha=alpha,
+                   marker=marker, facecolors="none",
+                   edgecolors=color, linewidths=0.8,
+                   label=label)
+
+    _scatter(mask_wrong,   "^", COLOR_WRONG,   "wrong")
+    _scatter(mask_correct, "o", COLOR_CORRECT, "correct")
+    _scatter(mask_unknown, "s", COLOR_UNKNOWN, "no_judge")
+
+    # per-step 聚合线
+    agg_x, agg_y = aggregate_per_step(vals_ok, steps_ok.astype(int), agg)
+    if agg_x.size > 0:
+        ax.plot(agg_x, agg_y, marker="o", markersize=3, linewidth=1.5,
+                color=COLOR_AGG, label=f"{agg} per step")
+
+    ax.set_xlabel("global_step")
+    ax.set_ylabel(y_label)
+    ax.set_title(title)
+
+    handles, labels = ax.get_legend_handles_labels()
+    uniq = dict(zip(labels, handles))
+    ax.legend(uniq.values(), uniq.keys(),
+              loc="best", fontsize="small", frameon=True)
+
+    fig.tight_layout()
+    fig.savefig(out_png, bbox_inches="tight", dpi=150)
+    plt.close(fig)
+    dt = time.time() - t0
+    print(f"[PLOT] {metric_name} -> {out_png}  (took {dt:.1f}s)")
+
+
+# ------------------ 指标分类逻辑 ------------------ #
+
+TRAINING_BASE = {
+    # 你在 builder 里一定有的
+    "ce_self_seq_mean", "ce_self_seq_sum",
+    "ce_ref_seq_mean", "ce_ref_seq_sum",
+    "reward_seq_sum",
+    "kl_seq_mean_log_ratio",
+    "entropy_seq_mean",
+    "response_len_tokens",
+    # 可能扩展出来的
+    "reward_seq_mean", "reward_seq_max",
+    "adv_seq_mean", "value_seq_mean",
+    "kl_value_mean", "kl_seq_sum_log_ratio",
+    "entropy_mean", "entropy_seq_sum",
+}
+
+TEXT_BASE = {
+    # text_metrics 全家桶
+    "resp_char_len", "resp_byte_len",
+    "non_ascii_ratio", "replacement_char_ratio",
+    "control_private_unassigned_ratio",
+    "repeat_char_run_max", "repeat_word_run_max",
+    "unique_word_ratio", "top1_word_prop",
+    "trigram_repeat_ratio",
+    "compress_ratio",
+    "char_entropy_bits_per_char",
+    # 结构指标（section/sentence）
+    "num_sections", "num_sentences",
+    "num_marker_sentences",
+    "num_self_reflect_sentences",
+    "num_contrast_sentences",
+    "num_conclude_sentences",
+    "num_marker_sections",
+    # 语言是否含中文（0/1/-1）也可以看成文本分布
+    "contain_chinese",
+}
+
+LANG_EMB_BASE = {
+    # 语言统计
+    "H_lang", "num_lang_major", "code_switch_count",
+    # embedding + cluster + loopiness
+    "all_r_dup", "all_cluster_count", "all_cluster_size_max",
+    "all_rho_max", "all_loopiness", "all_plateau_len_max",
+    "marker_r_dup", "marker_cluster_count", "marker_cluster_size_max",
+    "marker_rho_max", "marker_loopiness", "marker_plateau_len_max",
+    "wait_r_dup", "wait_cluster_count", "wait_cluster_size_max",
+    "wait_rho_max", "wait_loopiness", "wait_plateau_len_max",
+    "embedding_truncated",
+    # 综合指标
+    "rambling_score",
+}
+
+def categorize_metric(name: str) -> str:
+    """
+    返回类别: 'training' / 'text' / 'lang_emb'
+    尽量全面：先查基础集合，再用名字 heuristic。
+    """
+    if name in TRAINING_BASE:
+        return "training"
+    if name in TEXT_BASE:
+        return "text"
+    if name in LANG_EMB_BASE:
+        return "lang_emb"
+
+    # heuristics
+    lower = name.lower()
+
+    # RL / 训练相关
+    if lower.startswith("ce_") or "logprob" in lower or "reward" in lower:
+        return "training"
+    if "kl_" in lower or lower.startswith("entropy_") or lower.endswith("_tokens"):
+        return "training"
+
+    # 文本结构 / 质量
+    if lower.startswith("resp_") or "repeat_" in lower or "compress" in lower:
+        return "text"
+    if "entropy_bits_per_char" in lower or "byte_len" in lower or "char_len" in lower:
+        return "text"
+    if lower.startswith("num_") and ("section" in lower or "sentence" in lower or "marker" in lower):
+        return "text"
+    if "non_ascii" in lower or "replacement_char" in lower or "control_private_unassigned" in lower:
+        return "text"
+
+    # 语言/embedding/discourse
+    if "lang" in lower or "code_switch" in lower:
+        return "lang_emb"
+    if lower.startswith("all_") or lower.startswith("marker_") or lower.startswith("wait_"):
+        return "lang_emb"
+    if "loopiness" in lower or "rho_max" in lower or "cluster_" in lower:
+        return "lang_emb"
+    if "rambling" in lower or "embedding" in lower:
+        return "lang_emb"
+
+    # 默认：当作 training（纯数值指标）
+    return "training"
+
+
+def pretty_metric_name(name: str) -> str:
+    """
+    为常见指标给一个更友好的标题；没列出的就原样返回。
+    """
+    mapping = {
+        # training
+        "ce_self_seq_mean": "CE self (mean, nats)",
+        "ce_self_seq_sum":  "CE self (sum, nats)",
+        "ce_ref_seq_mean":  "CE ref (mean, nats)",
+        "ce_ref_seq_sum":   "CE ref (sum, nats)",
+        "reward_seq_sum":   "Reward (sum)",
+        "kl_seq_mean_log_ratio": "KL approx (mean log-ratio)",
+        "entropy_seq_mean": "Token entropy (mean)",
+        "response_len_tokens": "Response length (tokens)",
+
+        # text
+        "resp_char_len": "Response length (chars)",
+        "resp_byte_len": "Response length (bytes)",
+        "non_ascii_ratio": "Non-ASCII char ratio",
+        "replacement_char_ratio": "Replacement char (�) ratio",
+        "control_private_unassigned_ratio": "Ctrl/Private/Unassigned cat ratio",
+        "repeat_char_run_max": "Max repeated char run",
+        "repeat_word_run_max": "Max repeated word run",
+        "unique_word_ratio": "Unique word ratio",
+        "top1_word_prop": "Top-1 word proportion",
+        "trigram_repeat_ratio": "Repeated trigram ratio",
+        "compress_ratio": "Zlib compression ratio (↓ => more repetitive)",
+        "char_entropy_bits_per_char": "Char entropy (bits/char)",
+        "num_sections": "Num sections (\\n-based)",
+        "num_sentences": "Num sentences (pysbd)",
+        "num_marker_sentences": "Num sentences w/ markers",
+        "num_self_reflect_sentences": "Num SELF_REFLECT sentences",
+        "num_contrast_sentences": "Num CONTRAST sentences",
+        "num_conclude_sentences": "Num CONCLUDE sentences",
+        "num_marker_sections": "Num sections w/ markers",
+        "contain_chinese": "Contains Chinese (0/1)",
+
+        # lang / embedding
+        "H_lang": "Language entropy H_lang",
+        "num_lang_major": "Num major languages (>10%)",
+        "code_switch_count": "Language code-switch count",
+        "all_r_dup": "ALL: near-duplicate ratio",
+        "all_cluster_count": "ALL: cluster count",
+        "all_cluster_size_max": "ALL: largest cluster size",
+        "all_rho_max": "ALL: largest cluster ratio",
+        "all_loopiness": "ALL: loopiness (L/D)",
+        "all_plateau_len_max": "ALL: max plateau length",
+        "marker_r_dup": "MARKER: near-duplicate ratio",
+        "marker_cluster_count": "MARKER: cluster count",
+        "marker_cluster_size_max": "MARKER: largest cluster size",
+        "marker_rho_max": "MARKER: largest cluster ratio",
+        "marker_loopiness": "MARKER: loopiness (L/D)",
+        "marker_plateau_len_max": "MARKER: max plateau length",
+        "wait_r_dup": "WAIT: near-duplicate ratio",
+        "wait_cluster_count": "WAIT: cluster count",
+        "wait_cluster_size_max": "WAIT: largest cluster size",
+        "wait_rho_max": "WAIT: largest cluster ratio",
+        "wait_loopiness": "WAIT: loopiness (L/D)",
+        "wait_plateau_len_max": "WAIT: max plateau length",
+        "embedding_truncated": "Embedding truncated flag",
+        "rambling_score": "Rambling score",
+    }
+    return mapping.get(name, name)
+
+
+# ------------------ 主函数 ------------------ #
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features-dir", type=Path, required=True,
+                    help="build_features_preprocess / analysis 输出目录 (含 features*.parquet 和 meta_preprocess.json)")
+    ap.add_argument("--features-file", type=str, default=None,
+                    help="默认优先使用 features_analysis.parquet；若不存在则用 features.parquet；也可以手动指定文件名。")
+    ap.add_argument("--out-jsonl", type=Path, required=True,
+                    help="筛选后的样本 JSONL 输出路径（原始行的 byte copy）")
+    ap.add_argument("--plot-dir", type=Path, default=None,
+                    help="可视化输出目录（默认 = --features-dir）")
+
+    # 过滤条件
+    ap.add_argument("--cls", type=str, default="any",
+                    choices=["any","correct","wrong","no_judge"],
+                    help="按 cls_id 过滤：1=correct,0=wrong,2=no_judge")
+    ap.add_argument("--kept-or-dropped", type=str, default="all",
+                    choices=["all","kept","dropped"],
+                    help="按 kept_flag 过滤")
+    ap.add_argument("--chinese-or-english", type=str, default="all",
+                    choices=["all","chinese","english"],
+                    help="基于 contain_chinese 列 (1/0/-1)")
+    ap.add_argument("--step-min", type=int, default=None)
+    ap.add_argument("--step-max", type=int, default=None)
+    ap.add_argument("--where", type=str, default=None,
+                    help="pandas query 表达式，例如 'non_ascii_ratio>0.15 and repeat_word_run_max>10'")
+    ap.add_argument("--ge", action="append", default=[],
+                    help="阈值 'col:val' 表示 col >= val，可重复")
+    ap.add_argument("--le", action="append", default=[],
+                    help="阈值 'col:val' 表示 col <= val，可重复")
+    ap.add_argument("--eq", action="append", default=[],
+                    help="阈值 'col:val' 表示 col == val，可重复")
+    ap.add_argument("--logic", type=str, default="and", choices=["and","or"],
+                    help="--ge/--le/--eq 之间用 AND 还是 OR 组合")
+    ap.add_argument("--dedup-uid", action="store_true",
+                    help="按 uid 去重：同 uid 保留 (global_step, byte_offset) 最小的一条")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="全局最多保留多少条样本（排序之后截断）")
+    ap.add_argument("--per-step-limit", type=int, default=None,
+                    help="每个 global_step 最多保留多少条样本（排序之后 groupby head）")
+    ap.add_argument("--pattern-workers", type=int, default=0,
+                    help="文本模式匹配（重复啰嗦检测）使用的进程数；0 表示自动选择")
+
+    # 可视化控制
+    ap.add_argument("--no-plot", action="store_true",
+                    help="只做筛选 + JSONL 导出，不画图")
+    ap.add_argument("--metrics", type=str, default="all",
+                    help=(
+                        "要画哪些 metrics：\n"
+                        "  - 'all'        : 所有数值列按类别分三类画图\n"
+                        "  - 'training'   : 只画训练/RL 类指标\n"
+                        "  - 'text'       : 只画文本结构/质量指标\n"
+                        "  - 'lang_emb'   : 只画语言 & embedding 类指标\n"
+                        "  - 'm1,m2,...'  : 只画这些列名（会自动分到对应子目录）"
+                    ))
+    ap.add_argument("--agg", type=str, default="mean",
+                    choices=["mean","median","sum"],
+                    help="per-step 聚合方式")
+    ap.add_argument("--jitter", type=float, default=0.25)
+    ap.add_argument("--point-size", type=int, default=3)
+    ap.add_argument("--alpha", type=float, default=0.25)
+
+    args = ap.parse_args()
+    # 设置全局的文本模式匹配并行度
+    global PATTERN_WORKERS
+    cpu_total = os.cpu_count() or 1
+    if args.pattern_workers is None or args.pattern_workers <= 0:
+        # 默认：不把机器跑满，给 IO / 系统留一点空间
+        PATTERN_WORKERS = max(1, min(cpu_total, 32))
+    else:
+        # 不超过实际 CPU 数
+        PATTERN_WORKERS = max(1, min(int(args.pattern_workers), cpu_total))
+    print(f"[INFO] pattern_workers = {PATTERN_WORKERS} (available CPUs = {cpu_total})")
+
+    features_dir = args.features_dir
+    plot_dir = args.plot_dir or features_dir
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1) 选择 features parquet + meta
+    if args.features_file is not None:
+        features_path = features_dir / args.features_file
+    else:
+        c1 = features_dir / "features_analysis.parquet"
+        c2 = features_dir / "features.parquet"
+        if c1.exists():
+            features_path = c1
+        elif c2.exists():
+            features_path = c2
+        else:
+            raise FileNotFoundError("在 --features-dir 下找不到 features_analysis.parquet 或 features.parquet；"
+                                    "请用 --features-file 指定。")
+
+    meta_pre = features_dir / "meta_preprocess.json"
+    if not meta_pre.exists():
+        meta_pre = features_dir / "meta.json"
+    if not meta_pre.exists():
+        raise FileNotFoundError("未找到 meta_preprocess.json 或 meta.json，用于解析 source_jsonl 和 offset 信息。")
+
+    print(f"[INFO] Loading meta from {meta_pre}")
+    meta = json.loads(meta_pre.read_text(encoding="utf-8"))
+    source_jsonl = Path(meta["source_jsonl"])
+    if not source_jsonl.exists():
+        raise FileNotFoundError(f"source_jsonl 不存在: {source_jsonl}")
+
+    print(f"[INFO] Loading features from {features_path}")
+    t0 = time.time()
+    df = pd.read_parquet(features_path)
+    print(f"[INFO] features loaded: rows={len(df):,}, cols={len(df.columns)} in {time.time()-t0:.1f}s")
+
+    required_cols = ["global_step","byte_offset","byte_len","cls_id","kept_flag","contain_chinese"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise KeyError(f"features 中缺少必要列: {c}")
+
+    # 基本统计信息
+    total_rows = len(df)
+    num_kept = int((df["kept_flag"] == 1).sum())
+    num_dropped = int((df["kept_flag"] == 0).sum())
+
+    is_kept = (df["kept_flag"] == 1)
+    is_correct = (df["cls_id"] == 1)
+    is_wrong = (df["cls_id"] == 0)
+
+    num_kept_correct = int((is_kept & is_correct).sum())
+    num_kept_wrong   = int((is_kept & is_wrong).sum())
+
+    print(f"[STATS] Loaded samples (rows / jsonl lines): {total_rows:,}")
+    print(f"[STATS] kept    = {num_kept:,}")
+    print(f"[STATS] dropped = {num_dropped:,}")
+    print(f"[STATS] kept & correct = {num_kept_correct:,}")
+    print(f"[STATS] kept & wrong   = {num_kept_wrong:,}")
+
+    # ---------- 从原始 JSONL 补充 response_text 列，用于文本模式检测 ---------- #
+    if "response_text" not in df.columns:
+        print("[INFO] 'response_text' not in features; will load from source_jsonl for ALL rows...")
+        t_txt0 = time.time()
+        resp_list: List[str] = []
+
+        # 注意：这里假定每一行 JSON 里都有 'response_text' 字段
+        with source_jsonl.open("rb", buffering=1024 * 1024) as fsrc:
+            fileno = fsrc.fileno()
+            for _, row in df.iterrows():
+                off = int(row["byte_offset"])
+                ln  = int(row["byte_len"])
+                b   = os.pread(fileno, ln, off)
+                try:
+                    j = json.loads(b)
+                except Exception as e:
+                    # 出问题就给个占位，避免模式函数崩
+                    # 也方便后面你手动检查这几行
+                    print(f"error: e.")
+                    resp_list.append("")
+                    continue
+                resp_list.append(j.get("response_text", ""))
+
+        df["response_text"] = resp_list
+        print(f"[INFO] response_text column attached, took {time.time() - t_txt0:.1f}s")
+
+    # jitter 的种子：优先使用 sample_idx，其次 uid，最后用行号
+    if "sample_idx" in df.columns:
+        jitter_seed_full = df["sample_idx"].astype(int).to_numpy()
+    elif "uid" in df.columns:
+        jitter_seed_full = np.array([salt64_from_uid(u) for u in df["uid"].astype(str)], dtype=np.int64)
+    else:
+        jitter_seed_full = np.arange(len(df), dtype=np.int64)
+
+    # # 2) 构建筛选 mask
+    # n = len(df)
+    # mask = np.ones(n, dtype=bool)
+    # filter_applied = False
+
+    # # kept/dropped
+    # if args.kept_or_dropped == "kept":
+    #     mask &= (df["kept_flag"] == 1)
+    #     filter_applied = True
+    # elif args.kept_or_dropped == "dropped":
+    #     mask &= (df["kept_flag"] == 0)
+    #     filter_applied = True
+
+    # # cls
+    # if args.cls != "any":
+    #     cls_map = {"correct":1, "wrong":0, "no_judge":2}
+    #     mask &= (df["cls_id"] == cls_map[args.cls])
+    #     filter_applied = True
+
+    # # 中文/英文
+    # if args.chinese_or_english != "all":
+    #     if args.chinese_or_english == "chinese":
+    #         mask &= (df["contain_chinese"] == 1)
+    #     else:
+    #         mask &= (df["contain_chinese"] == 0)
+    #     filter_applied = True
+
+    # # global_step 范围
+    # if args.step_min is not None:
+    #     mask &= (df["global_step"] >= int(args.step_min))
+    #     filter_applied = True
+    # if args.step_max is not None:
+    #     mask &= (df["global_step"] <= int(args.step_max))
+    #     filter_applied = True
+
+    # # ge/le/eq
+    # ge_list = parse_cmp_list(args.ge)
+    # le_list = parse_cmp_list(args.le)
+    # eq_list = parse_cmp_list(args.eq)
+    # if ge_list or le_list or eq_list:
+    #     filter_applied = True
+    #     cur = np.zeros(n, dtype=bool) if args.logic == "or" else np.ones(n, dtype=bool)
+    #     def _comb(c1, c2):
+    #         return (c1 | c2) if args.logic == "or" else (c1 & c2)
+
+    #     for col, val in ge_list:
+    #         if col not in df.columns:
+    #             raise KeyError(f"--ge: unknown column {col}")
+    #         cond = (df[col].astype(float) >= float(val)).to_numpy()
+    #         cur = _comb(cur, cond)
+    #     for col, val in le_list:
+    #         if col not in df.columns:
+    #             raise KeyError(f"--le: unknown column {col}")
+    #         cond = (df[col].astype(float) <= float(val)).to_numpy()
+    #         cur = _comb(cur, cond)
+    #     for col, val in eq_list:
+    #         if col not in df.columns:
+    #             raise KeyError(f"--eq: unknown column {col}")
+    #         cond = (df[col].astype(float) == float(val)).to_numpy()
+    #         cur = _comb(cur, cond)
+    #     mask &= cur
+
+    # # where 表达式
+    # if args.where:
+    #     filter_applied = True
+    #     try:
+    #         idx_where = df.query(args.where, engine="python").index
+    #         cond = df.index.to_series().isin(idx_where).to_numpy()
+    #         mask &= cond
+    #     except Exception as e:
+    #         print(f"[ERROR] 解析 --where 失败: {e}", file=sys.stderr)
+    #         sys.exit(2)
+
+    # df_sel = df[mask].copy()
+    # print(f"[INFO] After filtering: rows={len(df_sel):,} (filter_applied={filter_applied})")
+    # # 2) 基于“模式匹配”做过滤
+    # keep_mask = build_filter_mask_by_patterns(df)
+    # df_sel = df[keep_mask].copy()
+
+    # filtered_cnt = int((~keep_mask).sum())
+    # filter_applied = filtered_cnt > 0
+
+    # print(f"[INFO] After pattern filtering: rows={len(df_sel):,}, "
+    #       f"filtered_out={filtered_cnt:,}")
+    # 2) 构建“过滤目标子集”：只在这个子集上应用模式过滤
+    #    你现在的用法一般是: --kept-or-dropped kept --cls correct
+    #    这样 target_mask 就刚好是 "kept & correct"
+    target_mask = np.ones(len(df), dtype=bool)
+
+    # 按 kept_or_dropped 子集
+    if args.kept_or_dropped == "kept":
+        target_mask &= (df["kept_flag"] == 1)
+    elif args.kept_or_dropped == "dropped":
+        target_mask &= (df["kept_flag"] == 0)
+    # "all" 的时候不收缩子集
+
+    # 按 cls 子集
+    if args.cls != "any":
+        cls_map = {"correct": 1, "wrong": 0, "no_judge": 2}
+        target_mask &= (df["cls_id"] == cls_map[args.cls])
+
+    # # 3) 基于模式过滤（只作用在 target_mask=True 的样本上）
+    # keep_mask, bad_mask = build_filter_mask_by_patterns(df, target_mask=target_mask)
+
+    # df_sel = df[keep_mask].copy()
+    # filtered_cnt = int(bad_mask.sum())
+    # filter_applied = filtered_cnt > 0
+
+    # # 在 kept 集合上的命中数量和比例
+    # bad_in_kept = int((bad_mask & is_kept.to_numpy()).sum())
+    # ratio_bad_in_kept = (bad_in_kept / num_kept) if num_kept > 0 else 0.0
+
+    # print(f"[INFO] After pattern filtering: rows={len(df_sel):,}")
+    # print(f"[STATS] pattern-matched samples (overall)  = {filtered_cnt:,}")
+    # print(f"[STATS] pattern-matched within kept       = {bad_in_kept:,} "
+    #       f"({ratio_bad_in_kept:.4%} of kept)")
+    # 3) 基于模式过滤（只作用在 target_mask=True 的样本上）
+    keep_mask, bad_mask = build_filter_mask_by_patterns(df, target_mask=target_mask)
+
+    # ⚠️ 这里“符合过滤条件的样本” = 被模式命中的样本 = bad_mask == True
+    df_sel = df[bad_mask].copy()
+    selected_cnt = int(bad_mask.sum())
+    filter_applied = True  # 确实应用了筛选逻辑
+
+    # 在 kept 集合上的命中数量和比例（占 kept 的比例）
+    bad_in_kept = int((bad_mask & is_kept.to_numpy()).sum())
+    ratio_bad_in_kept = (bad_in_kept / num_kept) if num_kept > 0 else 0.0
+
+    print(f"[INFO] Selected samples (pattern-matched): rows={len(df_sel):,}")
+    print(f"[STATS] pattern-matched samples (overall)  = {selected_cnt:,}")
+    print(f"[STATS] pattern-matched within kept       = {bad_in_kept:,} "
+          f"({ratio_bad_in_kept:.4%} of kept)")
+
+    # 去重 uid
+    if args.dedup_uid and "uid" in df_sel.columns:
+        df_sel = (df_sel.sort_values(["global_step","byte_offset"], kind="mergesort")
+                        .drop_duplicates("uid", keep="first"))
+        print(f"[INFO] After dedup uid: rows={len(df_sel):,}")
+
+    # per-step limit
+    if args.per_step_limit is not None and args.per_step_limit > 0:
+        df_sel = (df_sel.sort_values(["global_step","byte_offset"], kind="mergesort")
+                        .groupby("global_step", sort=False)
+                        .head(int(args.per_step_limit))
+                        .reset_index(drop=True))
+        print(f"[INFO] After per-step-limit={args.per_step_limit}: rows={len(df_sel):,}")
+
+    # global limit
+    if args.limit is not None and args.limit > 0:
+        df_sel = df_sel.sort_values(["global_step","byte_offset"], kind="mergesort")
+        df_sel = df_sel.head(int(args.limit))
+        print(f"[INFO] After limit={args.limit}: rows={len(df_sel):,}")
+    else:
+        df_sel = df_sel.sort_values(["global_step","byte_offset"], kind="mergesort")
+
+    # 3) 导出 JSONL（筛选结果）
+    print(f"[INFO] Export selected samples to JSONL: {args.out_jsonl}")
+    t1 = time.time()
+    with source_jsonl.open("rb", buffering=1024*1024) as fsrc, \
+         args.out_jsonl.open("wb") as fdst:
+        for _, row in df_sel.iterrows():
+            off = int(row["byte_offset"])
+            ln = int(row["byte_len"])
+            b = os.pread(fsrc.fileno(), ln, off)
+            fdst.write(b)
+    print(f"[INFO] JSONL export done, rows={len(df_sel):,}, took {time.time()-t1:.1f}s")
+
+    # 4) 可视化
+    if args.no_plot:
+        print("[INFO] --no-plot set, skip plotting.")
+        return
+
+    # 如果筛选结果为空 & 确实应用了过滤条件 -> plot 用全体样本
+    if df_sel.empty:
+        if filter_applied:
+            print("[WARN] 过滤条件太严格，选出 0 行；Plot 将回退使用全体样本。")
+            df_plot = df.copy()
+            jitter_seed_plot = jitter_seed_full
+        else:
+            print("[WARN] 没有任何样本（features 本身为空？），跳过 Plot。")
+            return
+    else:
+        df_plot = df_sel
+        jitter_seed_plot = jitter_seed_full[df_sel.index.to_numpy()]
+
+    print(f"[INFO] Plotting on rows={len(df_plot):,}")
+
+    steps = df_plot["global_step"].astype(int).to_numpy()
+    cls_id = df_plot["cls_id"].astype(int).to_numpy()
+
+    # 数值列（候选 metrics）
+    numeric_cols = [c for c in df_plot.columns
+                    if pd.api.types.is_numeric_dtype(df_plot[c])]
+    base_exclude = {"global_step", "line_no", "byte_offset", "byte_len",
+                    "valid", "kept_flag", "cls_id", "sample_idx"}
+    metric_candidates = [c for c in numeric_cols if c not in base_exclude]
+
+    # 根据 --metrics 决定要画哪些
+    metrics_arg = args.metrics.strip().lower()
+    metrics_training: List[str] = []
+    metrics_text: List[str] = []
+    metrics_lang_emb: List[str] = []
+
+    # 先分类所有候选
+    for name in metric_candidates:
+        cat = categorize_metric(name)
+        if cat == "training":
+            metrics_training.append(name)
+        elif cat == "text":
+            metrics_text.append(name)
+        else:
+            metrics_lang_emb.append(name)
+
+    if metrics_arg == "all":
+        pass  # 三类都用
+    elif metrics_arg in {"training","text","lang_emb"}:
+        if metrics_arg != "training":
+            metrics_training = []
+        if metrics_arg != "text":
+            metrics_text = []
+        if metrics_arg != "lang_emb":
+            metrics_lang_emb = []
+    else:
+        # 显式 metrics 列表
+        wanted = [m.strip() for m in args.metrics.split(",") if m.strip()]
+        wanted_set = set(wanted)
+        metrics_training = [m for m in metrics_training if m in wanted_set]
+        metrics_text     = [m for m in metrics_text     if m in wanted_set]
+        metrics_lang_emb = [m for m in metrics_lang_emb if m in wanted_set]
+
+    if not (metrics_training or metrics_text or metrics_lang_emb):
+        print("[WARN] 没有任何可画的 metrics（可能列名错误或者没有数值列），跳过 Plot。")
+        return
+
+    # 创建三个子文件夹
+    training_dir = plot_dir / "training"
+    text_dir     = plot_dir / "text"
+    lang_dir     = plot_dir / "lang_emb"
+    training_dir.mkdir(parents=True, exist_ok=True)
+    text_dir.mkdir(parents=True, exist_ok=True)
+    lang_dir.mkdir(parents=True, exist_ok=True)
+
+    # 真正绘图
+    def _plot_group(metric_list: List[str], subdir: Path, group_name: str):
+        if not metric_list:
+            print(f"[INFO] No metrics for group '{group_name}', skip.")
+            return
+        print(f"[INFO] Plotting group '{group_name}' ({len(metric_list)} metrics) -> {subdir}")
+        for m in metric_list:
+            vals = df_plot[m].astype("float64").to_numpy()
+            out_png = subdir / f"{m}.png"
+            scatter_one_metric(
+                out_png=out_png,
+                metric_name=m,
+                values=vals,
+                steps=steps,
+                cls_id=cls_id,
+                jitter_seeds=jitter_seed_plot,
+                agg=args.agg,
+                jitter=args.jitter,
+                point_size=args.point_size,
+                alpha=args.alpha,
+                y_label=pretty_metric_name(m),
+                title=pretty_metric_name(m),
+            )
+
+    _plot_group(metrics_training, training_dir, "training")
+    _plot_group(metrics_text,     text_dir,     "text")
+    _plot_group(metrics_lang_emb, lang_dir,     "lang_emb")
+
+    print(f"[DONE] Selection + plotting finished.\n"
+          f"  JSONL saved to: {args.out_jsonl}\n"
+          f"  Plots under:    {plot_dir} (subfolders: training/, text/, lang_emb/)")
+
+if __name__ == "__main__":
+    main()
+***************
+这是执行脚本：
+*******************************************************
+FeaturesDir="/remote-home1/yli/Workspace/BandPO/data/records/RLtraining_DapoMathDataset_DeepseekR1_1.5B/grpo_plus_ray_trgppo01_tokenmean_df/build_features_steps_sample010"
+OUT="/remote-home1/yli/Workspace/BandPO/data/records/RLtraining_DapoMathDataset_DeepseekR1_1.5B/grpo_plus_ray_trgppo01_tokenmean_df/build_features_steps_sample010/filter_test"
+
+python filter.py \
+  --features-dir "$FeaturesDir" \
+  --out-jsonl "$OUT/filtered_samples.jsonl" \
+  --plot-dir "$OUT/plot_dir" \
+  --cls correct \
+  --kept-or-dropped kept \
+  --chinese-or-english all \
+  --metrics all \
+  --agg mean \
+  --jitter 0.25 \
+  --point-size 3 \
+  --pattern-workers 120 \
+  --alpha 0.25
+**********************************************
+
+最后打印输出一下挑选出来的复合筛选条件的sample的数量，以及在原始集合集合中的kept部分的占比。
+
+之前给你的三个stage的代码是为了让你更好的理解如何计算follow我的计算方法，理解计算思路，并不是让你一定要照着他的逻辑框架写，因为之前需要分成三个阶段去做写入，但是现在不需要分成三阶段，都是直接在一个代码一次性快速计算搞定。注意算法细节一定要按照我的原来的算法细节来，千万不能改动，如果你觉得算法有问题，要先和我讨论，我允许修改再修改，原来的算法不能把它给简化了。比如原来的某些计算可以使用cpu集群多进程加速的但是我之前没做。我比较建议按照原来的逻辑做好句子切分，切分好之后先不急着算一些cpu消耗型feature，直接就去算embedding vector，算完之后，所有的计算都是cpu消耗型了，就直接多进程猛猛计算。要求计算从读取到最终筛选完毕有一个时间print出来。filter不需要画图功能。最后结果写入的jsonl就是直接输出good和bad sample的jsonl到两个文件，其中就直接包含好对应的filter_debug信息，不要把这个信息单独存储。之前的stage1，2，3的中间过程输出数据不要学，你不用去把中间信息保存下来，只需要学习他的框架和指标计算方法。
+
+所有的之前的计算统计指标都要求计算，并且对应到对应的sample中，最后写入到新的结果jsonl中方便我查看，并单独把被筛选的sample保存一份方便我debug查看。把所有的之前我提出的计算统计指标写成一个list（之后我可能还会需要增加一些指标，需要了我就打开他（就是把某一行的list的elemnt计算指标的注释取消掉），增加这个计算指标，并用于filter），这样方便我后期更改代码。filter中一些识别模板，保留这种代码逻辑。因为这样子做，我需要生效哪一些识别方法，直接去做模板的list的代码注释就好了。这样子很方便我去增加、或者删除过滤的一些识别逻辑。
+filter代码需要一个debug模式的开关（全局变量），前期使用时打开去print信息以及过滤好之后，计算结果jsonl的落盘。
+
+详细、全面、严谨的思考代码方案、策略，实现路径，然后给出完整全面的代码。直接给一个完整的代码，不一定要在我原来代码基础上做修改，更不要说去调用我之前的代码，我希望的事就是直接给我一份完整的代码，不要取调用之前我给你的代码，所有需要的代码都写在这一份代码中。
+
+开始思考。

@@ -1,0 +1,233 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  launcher:
+    _target_: hydra._internal.core_plugins.basic_launcher.BasicLauncher
+  sweeper:
+    _target_: hydra._internal.core_plugins.basic_sweeper.BasicSweeper
+    max_batch_size: null
+    params: null
+  help:
+    app_name: ${hydra.job.name}
+    header: '${hydra.help.app_name} is powered by Hydra.
+
+      '
+    footer: 'Powered by Hydra (https://hydra.cc)
+
+      Use --hydra-help to view Hydra specific help
+
+      '
+    template: '${hydra.help.header}
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (group=option)
+
+
+      $APP_CONFIG_GROUPS
+
+
+      == Config ==
+
+      Override anything in the config (foo.bar=value)
+
+
+      $CONFIG
+
+
+      ${hydra.help.footer}
+
+      '
+  hydra_help:
+    template: 'Hydra (${hydra.runtime.version})
+
+      See https://hydra.cc for more info.
+
+
+      == Flags ==
+
+      $FLAGS_HELP
+
+
+      == Configuration groups ==
+
+      Compose your configuration from those groups (For example, append hydra/job_logging=disabled
+      to command line)
+
+
+      $HYDRA_CONFIG_GROUPS
+
+
+      Use ''--cfg hydra'' to Show the Hydra config.
+
+      '
+    hydra_help: ???
+  hydra_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][HYDRA] %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers:
+      - console
+    loggers:
+      logging_example:
+        level: DEBUG
+    disable_existing_loggers: false
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: ${hydra.runtime.output_dir}/${hydra.job.name}.log
+    root:
+      level: INFO
+      handlers:
+      - console
+      - file
+    disable_existing_loggers: false
+  env: {}
+  mode: RUN
+  searchpath: []
+  callbacks: {}
+  output_subdir: .hydra
+  overrides:
+    hydra:
+    - hydra.mode=RUN
+    task:
+    - data.train_files=['/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/dapo_processed/modified/DAPO-Math-17k-Processed_modified.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/math-500/train/train_L3-5.parquet']
+    - data.val_files=['/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/aime2024_dapo/test.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/aime2025_dapo/test.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/amc2023_dapo/test.parquet']
+    - data.prompt_key=prompt
+    - data.filter_overlong_prompts=True
+    - data.truncation=error
+    - data.max_prompt_length=1024
+    - data.max_response_length=4096
+    - data.train_batch_size=256
+    - algorithm.adv_estimator=grpo
+    - algorithm.use_kl_in_reward=False
+    - algorithm.norm_adv_by_std_in_grpo=true
+    - actor_rollout_ref.model.path=/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+    - actor_rollout_ref.model.use_remove_padding=True
+    - actor_rollout_ref.model.enable_gradient_checkpointing=True
+    - actor_rollout_ref.actor.optim.lr=1e-6
+    - actor_rollout_ref.actor.ppo_mini_batch_size=64
+    - actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
+    - actor_rollout_ref.actor.use_kl_loss=True
+    - actor_rollout_ref.actor.kl_loss_coef=0.001
+    - actor_rollout_ref.actor.kl_loss_type=low_var_kl
+    - actor_rollout_ref.actor.clip_ratio_low=0.2
+    - actor_rollout_ref.actor.clip_ratio_high=0.2
+    - actor_rollout_ref.actor.clip_ratio_c=10.0
+    - actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean
+    - actor_rollout_ref.actor.entropy_coeff=0
+    - actor_rollout_ref.actor.ulysses_sequence_parallel_size=1
+    - actor_rollout_ref.actor.fsdp_config.param_offload=False
+    - actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    - actor_rollout_ref.rollout.n=16
+    - actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8
+    - actor_rollout_ref.rollout.tensor_model_parallel_size=1
+    - actor_rollout_ref.rollout.name=vllm
+    - actor_rollout_ref.rollout.gpu_memory_utilization=0.8
+    - actor_rollout_ref.rollout.max_num_batched_tokens=5120
+    - actor_rollout_ref.rollout.temperature=1.0
+    - actor_rollout_ref.rollout.top_p=1.0
+    - actor_rollout_ref.rollout.top_k=-1
+    - actor_rollout_ref.rollout.val_kwargs.temperature=1.0
+    - actor_rollout_ref.rollout.val_kwargs.top_p=1.0
+    - actor_rollout_ref.rollout.val_kwargs.top_k=-1
+    - actor_rollout_ref.rollout.val_kwargs.do_sample=True
+    - actor_rollout_ref.rollout.val_kwargs.n=32
+    - actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8
+    - actor_rollout_ref.ref.fsdp_config.param_offload=True
+    - actor_rollout_ref.ref.ulysses_sequence_parallel_size=1
+    - trainer.critic_warmup=0
+    - trainer.logger=["console","wandb"]
+    - trainer.project_name=VERL_DapoMath_DeepSeekR1DistillQwen1.5B
+    - trainer.experiment_name=grpo_official
+    - trainer.n_gpus_per_node=8
+    - trainer.nnodes=1
+    - trainer.val_before_train=True
+    - trainer.test_freq=5
+    - trainer.save_freq=10
+    - trainer.total_epochs=10
+    - trainer.default_local_dir=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/ckpts/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official
+    - +trainer.rollout_record_path=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/records/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official/sample_traces+2026-01-12_12-30-09.jsonl
+    - +trainer.rollout_record_detail=false
+    - actor_rollout_ref.rollout.calculate_log_probs=false
+    - +trainer.validate_record_path=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/records/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official/validate_samples+2026-01-12_12-30-09.jsonl
+    - trainer.resume_mode=auto
+  job:
+    name: main_ppo
+    chdir: null
+    override_dirname: +trainer.rollout_record_detail=false,+trainer.rollout_record_path=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/records/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official/sample_traces+2026-01-12_12-30-09.jsonl,+trainer.validate_record_path=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/records/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official/validate_samples+2026-01-12_12-30-09.jsonl,actor_rollout_ref.actor.clip_ratio_c=10.0,actor_rollout_ref.actor.clip_ratio_high=0.2,actor_rollout_ref.actor.clip_ratio_low=0.2,actor_rollout_ref.actor.entropy_coeff=0,actor_rollout_ref.actor.fsdp_config.optimizer_offload=False,actor_rollout_ref.actor.fsdp_config.param_offload=False,actor_rollout_ref.actor.kl_loss_coef=0.001,actor_rollout_ref.actor.kl_loss_type=low_var_kl,actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean,actor_rollout_ref.actor.optim.lr=1e-6,actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8,actor_rollout_ref.actor.ppo_mini_batch_size=64,actor_rollout_ref.actor.ulysses_sequence_parallel_size=1,actor_rollout_ref.actor.use_kl_loss=True,actor_rollout_ref.model.enable_gradient_checkpointing=True,actor_rollout_ref.model.path=/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B,actor_rollout_ref.model.use_remove_padding=True,actor_rollout_ref.ref.fsdp_config.param_offload=True,actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8,actor_rollout_ref.ref.ulysses_sequence_parallel_size=1,actor_rollout_ref.rollout.calculate_log_probs=false,actor_rollout_ref.rollout.gpu_memory_utilization=0.8,actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8,actor_rollout_ref.rollout.max_num_batched_tokens=5120,actor_rollout_ref.rollout.n=16,actor_rollout_ref.rollout.name=vllm,actor_rollout_ref.rollout.temperature=1.0,actor_rollout_ref.rollout.tensor_model_parallel_size=1,actor_rollout_ref.rollout.top_k=-1,actor_rollout_ref.rollout.top_p=1.0,actor_rollout_ref.rollout.val_kwargs.do_sample=True,actor_rollout_ref.rollout.val_kwargs.n=32,actor_rollout_ref.rollout.val_kwargs.temperature=1.0,actor_rollout_ref.rollout.val_kwargs.top_k=-1,actor_rollout_ref.rollout.val_kwargs.top_p=1.0,algorithm.adv_estimator=grpo,algorithm.norm_adv_by_std_in_grpo=true,algorithm.use_kl_in_reward=False,data.filter_overlong_prompts=True,data.max_prompt_length=1024,data.max_response_length=4096,data.prompt_key=prompt,data.train_batch_size=256,data.train_files=['/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/dapo_processed/modified/DAPO-Math-17k-Processed_modified.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/math-500/train/train_L3-5.parquet'],data.truncation=error,data.val_files=['/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/aime2024_dapo/test.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/aime2025_dapo/test.parquet',
+      '/inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/data/dataset/amc2023_dapo/test.parquet'],trainer.critic_warmup=0,trainer.default_local_dir=/inspire/hdd/project/exploration-topic/liyuan-p-liyuan/workspace/RSBand/data/ckpts/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/grpo_official,trainer.experiment_name=grpo_official,trainer.logger=["console","wandb"],trainer.n_gpus_per_node=8,trainer.nnodes=1,trainer.project_name=VERL_DapoMath_DeepSeekR1DistillQwen1.5B,trainer.resume_mode=auto,trainer.save_freq=10,trainer.test_freq=5,trainer.total_epochs=10,trainer.val_before_train=True
+    id: ???
+    num: ???
+    config_name: ppo_trainer
+    env_set: {}
+    env_copy: []
+    config:
+      override_dirname:
+        kv_sep: '='
+        item_sep: ','
+        exclude_keys: []
+  runtime:
+    version: 1.3.2
+    version_base: '1.3'
+    cwd: /inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/RLtraining/verl/baseline/DeepSeek-R1-Distill-Qwen-1.5B-L4k
+    config_sources:
+    - path: hydra.conf
+      schema: pkg
+      provider: hydra
+    - path: /inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/RLtraining/verl/verl/trainer/config
+      schema: file
+      provider: main
+    - path: ''
+      schema: structured
+      provider: schema
+    output_dir: /inspire/hdd/global_user/liyuan-p-liyuan/workspace/RSBand/RLtraining/verl/baseline/DeepSeek-R1-Distill-Qwen-1.5B-L4k/outputs/2026-01-12/12-31-57
+    choices:
+      reward_model: dp_reward_model
+      critic: dp_critic
+      critic/../engine@critic.model.fsdp_config: fsdp
+      critic/../optim@critic.optim: fsdp
+      model@actor_rollout_ref.model: hf_model
+      rollout@actor_rollout_ref.rollout: rollout
+      ref@actor_rollout_ref.ref: dp_ref
+      ref/../engine@actor_rollout_ref.ref.fsdp_config: fsdp
+      data: legacy_data
+      actor@actor_rollout_ref.actor: dp_actor
+      actor/../engine@actor_rollout_ref.actor.fsdp_config: fsdp
+      actor/../optim@actor_rollout_ref.actor.optim: fsdp
+      hydra/env: default
+      hydra/callbacks: null
+      hydra/job_logging: default
+      hydra/hydra_logging: default
+      hydra/hydra_help: default
+      hydra/help: default
+      hydra/sweeper: basic
+      hydra/launcher: basic
+      hydra/output: default
+  verbose: false

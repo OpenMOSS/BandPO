@@ -1,0 +1,40 @@
+# -------- 通用忽略（对全仓库生效）--------
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+*.egg-info/
+.build/
+build/
+dist/
+.eggs/
+.sii/
+
+# 虚拟环境/本地配置
+.venv/
+venv/
+.env
+*.log
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# -------- data 目录的专门规则 --------
+# 默认忽略 data 下所有内容
+data/**
+# 但保留 data 的目录结构
+!data/**/
+# 以及 data 下的 .py / .sh 文件
+!data/**/*.py
+!data/**/*.sh
+# 和占位文件（用于保留空目录）
+!data/**/.gitkeep
+
+# ignore wheels
+installing/*.whl
+*.whl

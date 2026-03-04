@@ -1,0 +1,1 @@
+1. vllm跑embedding模型：你原来计划的是8 个 vLLM OpenAPI 服务 + HTTP 调用。我看到你是自己用一张卡跑了一个模型。因为在Python代码里，没办法同时启动8个模型，vllm调用时，python代码里直接调用0号卡，无法指定显卡号，只能在外部启动python时设置export cuda visible。所以需要一个分别启动8个vllm的embedding model的代码。还需要修改对应的调用embedding的代码。

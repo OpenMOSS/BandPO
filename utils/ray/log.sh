@@ -1,0 +1,2 @@
+ray job logs raysubmit_XhP3LzFiq5EuCBVQ
+ray job logs raysubmit_XhP3LzFiq5EuCBVQ
