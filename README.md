@@ -1,6 +1,6 @@
 # BandPO: Bridging Trust Regions and Ratio Clipping via Probability-Aware Bounds for LLM Reinforcement Learning
 
-[![Paper](https://img.shields.io/badge/Paper-Arxiv-red.svg)](#) [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Paper](https://img.shields.io/badge/Paper-Arxiv-red.svg)](https://arxiv.org/abs/2603.04918) [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 This is the official repository for **BandPO**, a novel reinforcement learning algorithm designed to resolve the fundamental exploration bottlenecks in Large Language Model (LLM) post-training. 
 
@@ -278,9 +278,12 @@ For any questions, discussions, or collaborations, feel free to reach out:
 If you find BandPO or this repository useful in your research, please consider citing our paper:
 
 ```bibtex
-@article{li2024bandpo,
-  title={BandPO: Bridging Trust Regions and Ratio Clipping via Probability-Aware Bounds for LLM Reinforcement Learning},
-  author={Li, Yuan and Wang, Bo and Gao, Yufei and Yao, Yuqian and Wang, Xinyuan and Yin, Zhangyue and Qiu, Xipeng},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2024}
+@misc{li2026bandpobridgingtrustregions,
+      title={BandPO: Bridging Trust Regions and Ratio Clipping via Probability-Aware Bounds for LLM Reinforcement Learning}, 
+      author={Yuan Li and Bo Wang and Yufei Gao and Yuqian Yao and Xinyuan Wang and Zhangyue Yin and Xipeng Qiu},
+      year={2026},
+      eprint={2603.04918},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.04918}, 
 }
