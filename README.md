@@ -287,3 +287,8 @@ If you find BandPO or this repository useful in your research, please consider c
       primaryClass={cs.LG},
       url={https://arxiv.org/abs/2603.04918}, 
 }
+```
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/image?repos=OpenMOSS/BandPO&type=date&legend=top-left)](https://www.star-history.com/?repos=OpenMOSS%2FBandPO&type=date&legend=top-left)
