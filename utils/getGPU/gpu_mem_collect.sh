@@ -1,0 +1,1 @@
+python3 gpu_mem_collect.py -i 1 -o gpu_mem.csv --mode refresh

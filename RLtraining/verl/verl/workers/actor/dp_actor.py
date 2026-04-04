@@ -19,6 +19,7 @@ Single Process Actor
 
 import logging
 import os
+import time
 
 import torch
 from torch import nn
@@ -208,7 +209,9 @@ __all__ = ["DataParallelPPOActor"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-
+def _sync_if_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 class DataParallelPPOActor(BasePPOActor):
     """FSDP DataParallel PPO Actor or Ref worker
 
@@ -247,7 +250,8 @@ class DataParallelPPOActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
-
+        self._last_time_comparison_summary = None
+        
     def _forward_micro_batch(
         self, micro_batch, temperature, calculate_entropy=False
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -525,6 +529,9 @@ class DataParallelPPOActor(BasePPOActor):
         # make sure we are in training mode
         self.actor_module.train()
 
+        _sync_if_cuda()
+        update_policy_t0 = time.perf_counter()
+        
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
         global_steps  = int(data.meta_info.get("global_steps", -1))
@@ -561,8 +568,29 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
+        time_method = (
+            self.config.get("tokenwise_ratio_bounds_method", "clip")
+            if self.config.get("use_tokenwise_ratio_bounds", False)
+            else "clip"
+        )
 
+        time_summary_total = {
+            "step": int(global_steps),
+            "method": time_method,
+            "num_mini_batches": 0,
+            "num_policy_loss_calls": 0,
+            "num_optimizer_steps": 0,
+            "dense_tokens_sum": 0,
+            "valid_tokens_sum": 0,
+            "bound_total_ms_sum": 0.0,
+            "bound_core_ms_sum": 0.0,
+            "clip_apply_ms_sum": 0.0,
+            "clip_related_ms_sum": 0.0,
+            "mini_batch_total_ms_sum": 0.0,
+            "update_policy_total_ms": 0.0,
+        }
+        # for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
             if self.is_debug and self.debug_record_path:
                 with open(self.debug_record_path, "a") as f:
                     f.write(f"_________one_epoch_start_________\n")
@@ -578,7 +606,19 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                
+                _sync_if_cuda()
+                mini_t0 = time.perf_counter()
 
+                mini_time = {
+                    "num_policy_loss_calls": 0,
+                    "dense_tokens_sum": 0,
+                    "valid_tokens_sum": 0,
+                    "bound_total_ms_sum": 0.0,
+                    "bound_core_ms_sum": 0.0,
+                    "clip_apply_ms_sum": 0.0,
+                }
+                
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
@@ -660,12 +700,32 @@ class DataParallelPPOActor(BasePPOActor):
                         # config=cfg,
                         rollout_log_probs=rollout_log_probs,
                     )
+                    # if isinstance(outputs, tuple) and len(outputs) == 5:
+                    #     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_clip_metrics = outputs
+                    # else:
+                    #     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = outputs
+                    #     extra_clip_metrics = {}
                     if isinstance(outputs, tuple) and len(outputs) == 5:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_clip_metrics = outputs
                     else:
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = outputs
                         extra_clip_metrics = {}
 
+                    mini_time["num_policy_loss_calls"] += 1
+
+                    time_info = None
+                    if isinstance(extra_clip_metrics, dict):
+                        time_info = extra_clip_metrics.pop("__time_comparison__", None)
+
+                    if time_info is not None:
+                        mini_time["dense_tokens_sum"] += int(time_info.get("dense_tokens", 0))
+                        mini_time["valid_tokens_sum"] += int(time_info.get("valid_tokens", 0))
+                        mini_time["bound_total_ms_sum"] += float(time_info.get("bound_total_ms", 0.0))
+                        mini_time["bound_core_ms_sum"] += float(time_info.get("bound_core_ms", 0.0))
+                        mini_time["clip_apply_ms_sum"] += float(time_info.get("clip_apply_ms", 0.0))
+                    
+                    
+                    
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
@@ -708,6 +768,47 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                
+                _sync_if_cuda()
+                mini_batch_total_ms = (time.perf_counter() - mini_t0) * 1000.0
+                clip_related_ms_sum = mini_time["bound_total_ms_sum"] + mini_time["clip_apply_ms_sum"]
+
+                time_summary_total["num_mini_batches"] += 1
+                time_summary_total["num_policy_loss_calls"] += mini_time["num_policy_loss_calls"]
+                time_summary_total["num_optimizer_steps"] += 1
+                time_summary_total["dense_tokens_sum"] += mini_time["dense_tokens_sum"]
+                time_summary_total["valid_tokens_sum"] += mini_time["valid_tokens_sum"]
+                time_summary_total["bound_total_ms_sum"] += mini_time["bound_total_ms_sum"]
+                time_summary_total["bound_core_ms_sum"] += mini_time["bound_core_ms_sum"]
+                time_summary_total["clip_apply_ms_sum"] += mini_time["clip_apply_ms_sum"]
+                time_summary_total["clip_related_ms_sum"] += clip_related_ms_sum
+                time_summary_total["mini_batch_total_ms_sum"] += mini_batch_total_ms
+
+                if torch.distributed.get_rank() == 0:
+                    clip_related_ratio = clip_related_ms_sum / mini_batch_total_ms if mini_batch_total_ms > 0 else 0.0
+                    clip_related_ms_per_1k_dense_tokens = (
+                        clip_related_ms_sum * 1000.0 / max(mini_time["dense_tokens_sum"], 1)
+                    )
+                    print(
+                        f"[time comparison] "
+                        f"step={global_steps} "
+                        f"method={time_method} "
+                        f"epoch={epoch_idx} "
+                        f"mini_batch={batch_idx + 1}/{len(mini_batches)} "
+                        f"mini_batch_total_ms={mini_batch_total_ms:.3f} "
+                        f"num_micro_batches={len(micro_batches)} "
+                        f"policy_loss_calls={mini_time['num_policy_loss_calls']} "
+                        f"optimizer_steps=1 "
+                        f"dense_tokens={mini_time['dense_tokens_sum']} "
+                        f"valid_tokens={mini_time['valid_tokens_sum']} "
+                        f"bound_total_ms={mini_time['bound_total_ms_sum']:.3f} "
+                        f"bound_core_ms={mini_time['bound_core_ms_sum']:.3f} "
+                        f"clip_apply_ms={mini_time['clip_apply_ms_sum']:.3f} "
+                        f"clip_related_ms={clip_related_ms_sum:.3f} "
+                        f"clip_related_ratio={clip_related_ratio:.6f} "
+                        f"clip_related_ms_per_1k_dense_tokens={clip_related_ms_per_1k_dense_tokens:.6f}"
+                    )
+                    
             final_clip_metrics = _clip_agg.finalize()
             append_to_dict(metrics, final_clip_metrics)
             if self.is_debug and self.debug_record_path:
@@ -715,4 +816,7 @@ class DataParallelPPOActor(BasePPOActor):
                     f.write(f"_________one_epoch_end__________\n")
                     f.write(f"str(metrics): {str(metrics)}\n")
         self.actor_optimizer.zero_grad()
+        _sync_if_cuda()
+        time_summary_total["update_policy_total_ms"] = (time.perf_counter() - update_policy_t0) * 1000.0
+        self._last_time_comparison_summary = time_summary_total
         return metrics

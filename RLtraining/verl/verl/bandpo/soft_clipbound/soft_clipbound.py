@@ -473,6 +473,7 @@ def apply_soft_clip(
     """
     统一接口：返回 y = soft_clip_method(ratio; bounds, hyper-params).
     """
+    
     if torch.is_tensor(bound_low):
         pass
     else:
@@ -483,6 +484,7 @@ def apply_soft_clip(
     else:
         bound_high = _const_like(ratio, bound_high)
     if bound_high.requires_grad: bound_high = bound_high.detach()
+    
     m = method.lower()
     if m == "hard":
         return torch.clamp(ratio, min=bound_low, max=bound_high)

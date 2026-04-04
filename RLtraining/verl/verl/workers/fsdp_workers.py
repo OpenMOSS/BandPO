@@ -23,6 +23,7 @@ import os
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
+import time
 
 import numpy as np
 import psutil
@@ -96,6 +97,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
 
+def _sync_if_cuda() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
@@ -782,6 +786,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+
+        global_steps = int(data.meta_info.get("global_steps", -1))
+        _sync_if_cuda()
+        step_t0 = time.perf_counter()
+                
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
@@ -818,6 +827,41 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
+
+        _sync_if_cuda()
+        step_total_ms = (time.perf_counter() - step_t0) * 1000.0
+        time_summary = getattr(self.actor, "_last_time_comparison_summary", None)
+        if torch.distributed.get_rank() == 0:
+            if isinstance(time_summary, dict):
+                clip_related_ms = float(time_summary.get("clip_related_ms_sum", 0.0))
+                clip_related_ratio = clip_related_ms / step_total_ms if step_total_ms > 0 else 0.0
+                clip_related_ms_per_1k_dense_tokens = (
+                    clip_related_ms * 1000.0 / max(int(time_summary.get("dense_tokens_sum", 0)), 1)
+                )
+                print(
+                    f"[time comparison] "
+                    f"step={global_steps} "
+                    f"method={time_summary.get('method', 'unknown')} "
+                    f"step_total_ms={step_total_ms:.3f} "
+                    f"update_policy_total_ms={float(time_summary.get('update_policy_total_ms', 0.0)):.3f} "
+                    f"num_mini_batches={int(time_summary.get('num_mini_batches', 0))} "
+                    f"policy_loss_calls={int(time_summary.get('num_policy_loss_calls', 0))} "
+                    f"optimizer_steps={int(time_summary.get('num_optimizer_steps', 0))} "
+                    f"dense_tokens={int(time_summary.get('dense_tokens_sum', 0))} "
+                    f"valid_tokens={int(time_summary.get('valid_tokens_sum', 0))} "
+                    f"bound_total_ms={float(time_summary.get('bound_total_ms_sum', 0.0)):.3f} "
+                    f"bound_core_ms={float(time_summary.get('bound_core_ms_sum', 0.0)):.3f} "
+                    f"clip_apply_ms={float(time_summary.get('clip_apply_ms_sum', 0.0)):.3f} "
+                    f"clip_related_ms={clip_related_ms:.3f} "
+                    f"clip_related_ratio={clip_related_ratio:.6f} "
+                    f"clip_related_ms_per_1k_dense_tokens={clip_related_ms_per_1k_dense_tokens:.6f}"
+                )
+            else:
+                print(
+                    f"[time comparison] "
+                    f"step={global_steps} "
+                    f"step_total_ms={step_total_ms:.3f}"
+                )
 
         return output
 

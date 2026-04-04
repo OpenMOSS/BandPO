@@ -61,10 +61,12 @@ INTERVAL_MINUTES=15
 # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/bandpo__grpo_plus_ray_bandkl005/2026-03-04_01-28-21/wandb/offline-run-20260304_013440-spxasih9",
 # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/bandpo__grpo_plus_ray_bandtv005/2026-03-04_01-29-00/wandb/offline-run-20260304_013440-jpjiot51"
 
+  # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandchi2005/2026-03-05_02-19-02/wandb/offline-run-20260305_022531-7emynxze",
+  # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandkl005/2026-03-05_02-18-14/wandb/offline-run-20260305_022531-7jia9d8x",
+  # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandtv005/2026-03-05_02-19-31/wandb/offline-run-20260305_022531-2j1mr5bv"
+
 PATHS_JSON='[
-  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandchi2005/2026-03-05_02-19-02/wandb/offline-run-20260305_022531-7emynxze",
-  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandkl005/2026-03-05_02-18-14/wandb/offline-run-20260305_022531-7jia9d8x",
-  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandtv005/2026-03-05_02-19-31/wandb/offline-run-20260305_022531-2j1mr5bv"
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/dcpo__grpo_plus_ray_dac/2026-03-27_16-43-15/wandb/offline-run-20260327_164720-kamky5g9"
 ]'
 # ====== 写死配置区结束 ======
 

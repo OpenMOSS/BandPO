@@ -27,7 +27,6 @@ from typing import Any, Callable, Optional, Dict
 import numpy as np
 import torch
 from omegaconf import DictConfig
-import time
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import AlgoConfig
@@ -37,31 +36,8 @@ from verl.bandpo.cubic_polynomial.trust_region_mapping_clip import TrustRegionMa
 from verl.bandpo.kl2clipbound.tokenwise_clipbound import compute_tokenwise_ratio_bounds_core
 from verl.bandpo.soft_clipbound.soft_clipbound import apply_soft_clip
 from verl.bandpo.decaying_clipbound.decaying_clipbound import apply_decaying_clip
-from verl.bandpo.band.band import band, get_last_band_time_profile
-from verl.bandpo.baseline_dcpo.dac import (
-    compute_dcpo_dac_ratio_bounds,
-    get_last_dcpo_dac_time_profile,
-)
-
-def _sync_if_cuda(device: torch.device) -> None:
-    if device.type == "cuda" and torch.cuda.is_available():
-        torch.cuda.synchronize(device)
-
-def _cuda_event_elapsed_ms(fn, device: torch.device):
-    if device.type == "cuda" and torch.cuda.is_available():
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        out = fn()
-        end.record()
-        end.synchronize()
-        return out, float(start.elapsed_time(end))
-
-    _sync_if_cuda(device)
-    t0 = time.perf_counter()
-    out = fn()
-    _sync_if_cuda(device)
-    return out, (time.perf_counter() - t0) * 1000.0
+from verl.bandpo.band.band import band
+from verl.bandpo.baseline_dcpo.dac import compute_dcpo_dac_ratio_bounds
 
 PolicyLossFn = Callable[
     [
@@ -983,18 +959,6 @@ def compute_policy_loss_vanilla(
     # 近似KL取对数计算policy ratio
     ratio = torch.exp(negative_approx_kl)
     pg_losses1 = -advantages * ratio
-
-    time_method = tokenwise_ratio_bounds_method if use_tokenwise_ratio_bounds else "clip"
-    time_profile = {
-        "step": int(global_steps),
-        "method": time_method,
-        "dense_tokens": int(old_log_prob.numel()),
-        "valid_tokens": int(response_mask.sum().item()),
-        "bound_total_ms": 0.0,
-        "bound_core_ms": 0.0,
-        "clip_apply_ms": 0.0,
-    }
-    
     if use_tokenwise_ratio_bounds:
         if tokenwise_ratio_bounds_method=="cubic_polynomial":
             tr_cfg = TrustRegionMappingClipConfig(
@@ -1006,38 +970,20 @@ def compute_policy_loss_vanilla(
                 mapping_ratio_min_cap=mapping_ratio_min_cap,
                 mapping_ratio_max_cap=mapping_ratio_max_cap,
             )
-            # bound_low, bound_high = compute_tokenwise_ratio_bounds(old_log_prob, cfg=tr_cfg)
-            (bound_low, bound_high), bound_total_ms = _cuda_event_elapsed_ms(
-                lambda: compute_tokenwise_ratio_bounds(old_log_prob, cfg=tr_cfg),
-                old_log_prob.device,
-            )
-            bound_core_ms = 0.0            
+            bound_low, bound_high = compute_tokenwise_ratio_bounds(old_log_prob, cfg=tr_cfg)
         elif tokenwise_ratio_bounds_method == "dcpodac":
             # Note:
             # This baseline isolates DCPO's Dynamic Adaptive Clipping (DAC) only.
             # It does NOT include other DCPO components such as SAS or OTM.
             # The rest of the training pipeline remains unchanged for a clean clipping-only comparison.
-            # bound_low, bound_high = compute_dcpo_dac_ratio_bounds(
-            #     old_log_prob,
-            #     eps_clip_low=clip_ratio_low,
-            #     eps_clip_high=clip_ratio_high,
-            #     ratio_max=dcpo_dac_ratio_max,
-            #     q_min=dcpo_dac_q_min,
-            #     MIN_LOGP=-700.0,
-            # )
-            (bound_low, bound_high), bound_total_ms = _cuda_event_elapsed_ms(
-                lambda: compute_dcpo_dac_ratio_bounds(
-                    old_log_prob,
-                    eps_clip_low=clip_ratio_low,
-                    eps_clip_high=clip_ratio_high,
-                    ratio_max=dcpo_dac_ratio_max,
-                    q_min=dcpo_dac_q_min,
-                    MIN_LOGP=-700.0,
-                ),
-                old_log_prob.device,
+            bound_low, bound_high = compute_dcpo_dac_ratio_bounds(
+                old_log_prob,
+                eps_clip_low=clip_ratio_low,
+                eps_clip_high=clip_ratio_high,
+                ratio_max=dcpo_dac_ratio_max,
+                q_min=dcpo_dac_q_min,
+                MIN_LOGP=-700.0,
             )
-            dcpo_prof = get_last_dcpo_dac_time_profile()
-            bound_core_ms = float(dcpo_prof.get("core_ms", 0.0))
         else:
             # bound_low, bound_high = compute_tokenwise_ratio_bounds_core(
             #     old_log_prob,
@@ -1055,52 +1001,25 @@ def compute_policy_loss_vanilla(
             #     TINY_ABS=1e-18, REL_MARGIN=1e-12, BRACKET_ABS=1e-12, MIN_LOGP=-700.0,
             # )
             # === 这里换成了 V2 的主入口 band ===
-            # bound_low, bound_high = band(
-            #     old_log_prob,
-            #     method=tokenwise_ratio_bounds_method,
-            #     delta=band_radius_delta_now,
-            #     eps_clip_high=clip_ratio_high,
-            #     eps_clip_low=clip_ratio_low,
-            #     does_relax_high_p_bound=does_relax_high_p_bound,
-            #     upper_bound_max=upper_bound_max,
-            #     MIN_LOGP=-700.0,
-            # )
-            (bound_low, bound_high), bound_total_ms = _cuda_event_elapsed_ms(
-                lambda: band(
-                    old_log_prob,
-                    method=tokenwise_ratio_bounds_method,
-                    delta=band_radius_delta_now,
-                    eps_clip_high=clip_ratio_high,
-                    eps_clip_low=clip_ratio_low,
-                    does_relax_high_p_bound=does_relax_high_p_bound,
-                    upper_bound_max=upper_bound_max,
-                    MIN_LOGP=-700.0,
-                ),
-                old_log_prob.device,
+            bound_low, bound_high = band(
+                old_log_prob,
+                method=tokenwise_ratio_bounds_method,
+                delta=band_radius_delta_now,
+                eps_clip_high=clip_ratio_high,
+                eps_clip_low=clip_ratio_low,
+                does_relax_high_p_bound=does_relax_high_p_bound,
+                upper_bound_max=upper_bound_max,
+                MIN_LOGP=-700.0,
             )
-            band_prof = get_last_band_time_profile()
-            bound_core_ms = float(band_prof.get("core_ms", 0.0))
-        time_profile["bound_total_ms"] = float(bound_total_ms)
-        time_profile["bound_core_ms"] = float(bound_core_ms)
         # ratio_clamped = torch.clamp(ratio, min=bound_low, max=bound_high)
-        # ratio_clamped = apply_soft_clip(ratio, bound_low, bound_high, soft_clip_methods)
-        ratio_clamped, clip_apply_ms = _cuda_event_elapsed_ms(
-            lambda: apply_soft_clip(ratio, bound_low, bound_high, soft_clip_methods),
-            ratio.device,
-        )
-        time_profile["clip_apply_ms"] = float(clip_apply_ms)
+        ratio_clamped = apply_soft_clip(ratio, bound_low, bound_high, soft_clip_methods)
     else:
         # - clip(ratio, 1-clip_ratio_low, 1+clip_ratio_high) * A
         low_scalar = 1.0 - clip_ratio_low
         high_scalar = 1.0 + clip_ratio_high
         # ratio_clamped = torch.clamp(ratio,low_scalar,high_scalar)
-        # ratio_clamped = apply_soft_clip(ratio, low_scalar, high_scalar, soft_clip_methods)
-        ratio_clamped, clip_apply_ms = _cuda_event_elapsed_ms(
-            lambda: apply_soft_clip(ratio, low_scalar, high_scalar, soft_clip_methods),
-            ratio.device,
-        )
-        time_profile["clip_apply_ms"] = float(clip_apply_ms)
-        
+        ratio_clamped = apply_soft_clip(ratio, low_scalar, high_scalar, soft_clip_methods)
+
     method_desc = ""
     if use_tokenwise_ratio_bounds:
         if tokenwise_ratio_bounds_method == "dcpodac":
@@ -1141,7 +1060,6 @@ def compute_policy_loss_vanilla(
             f"; eps_high={clip_ratio_high}"
         )
     print(
-        f"[time comparison] step={global_steps} "
         f"[policy_loss_config] "
         f"use_tokenwise_ratio_bounds={use_tokenwise_ratio_bounds}; "
         f"use_soft_clip={use_soft_clip}; "
@@ -1319,9 +1237,7 @@ def compute_policy_loss_vanilla(
         pg_losses = pg_losses * tis_imp_ratio
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-    
-    extra_clip_metrics["__time_comparison__"] = time_profile
-    
+
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower, extra_clip_metrics
 
 
