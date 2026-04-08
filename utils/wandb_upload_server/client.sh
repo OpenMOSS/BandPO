@@ -65,8 +65,15 @@ INTERVAL_MINUTES=15
   # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandkl005/2026-03-05_02-18-14/wandb/offline-run-20260305_022531-7jia9d8x",
   # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandtv005/2026-03-05_02-19-31/wandb/offline-run-20260305_022531-2j1mr5bv"
 
+  # "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/dcpo__grpo_plus_ray_dac/2026-03-27_16-43-15/wandb/offline-run-20260327_164720-kamky5g9"
+
+
 PATHS_JSON='[
-  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_Qwen2.5Instruct3B/dcpo__grpo_plus_ray_dac/2026-03-27_16-43-15/wandb/offline-run-20260327_164720-kamky5g9"
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_DeepSeekR1DistillQwen7B/dcpo__grpo_plus_ray_dac/2026-04-05_05-27-18/wandb/offline-run-20260405_053610-7p60x2rz",
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_DeepSeekR1DistillLlama8B/dcpo__grpo_plus_ray_dac/2026-04-05_05-35-27/wandb/offline-run-20260405_054422-jkrevu8a",
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_DapoMath_DeepSeekR1DistillQwen1.5B/dcpo__grpo_plus_ray_dac/2026-04-06_05-26-27/wandb/offline-run-20260406_053518-gfzlvnbr",
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_commonsenseqa_Qwen2.5Instruct3B/bandpo__grpo_plus_ray_bandkl005/2026-04-07_16-24-01/wandb/offline-run-20260407_162706-uw8x0ixb",
+  "/inspire/qb-ilm/project/exploration-topic/liyuan-p-liyuan/workspace/BandPO/data/wandb/VERL_commonsenseqa_Qwen2.5Instruct3B/grpo_official/2026-04-07_16-33-55/wandb/offline-run-20260407_163753-gdg2ecdh"
 ]'
 # ====== 写死配置区结束 ======
 
