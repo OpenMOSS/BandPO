@@ -38,3 +38,6 @@ data/**
 # ignore wheels
 installing/*.whl
 *.whl
+
+core
+core.*
